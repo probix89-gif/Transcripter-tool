@@ -164,7 +164,8 @@ def fetch_transcript_text(video_id: str, preferred_langs=("en",)) -> tuple[str, 
     first, then falls back to auto-generated ones, in the preferred
     languages, then finally whatever is available.
     """
-    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+    ytt_api = YouTubeTranscriptApi()
+    transcript_list = ytt_api.list(video_id)
 
     transcript = None
     try:
@@ -194,14 +195,29 @@ def clean_transcript(entries) -> str:
     paragraphs: strip timestamps, fix spacing/line-break artifacts, and
     start a new paragraph whenever there's a natural pause (>2.5s gap)
     in the speech.
+
+    Some caption tracks (especially community-uploaded / lyric-style ones)
+    embed a literal timestamp label like "0:05" or "[1:23:45]" at the START
+    of each caption line, separate from the real start/duration timing
+    metadata. Left in, these get mistranslated and read aloud as digits by
+    TTS, so a *leading* timestamp is stripped here. Only the leading
+    position is targeted — a time mentioned naturally mid-sentence (e.g.
+    "the meeting is at 10:30") is left alone since it's real spoken
+    content, not an artifact. The real timing used for paragraph breaks
+    below always comes from entry.start/entry.duration, never the text.
     """
+    leading_timestamp = re.compile(
+        r"^[\[\(]?\d{1,2}(?::\d{2}){1,2}\b[\]\)]?\s*[-–—:]?\s*"
+    )
+
     paragraphs = []
     current = []
     last_end = 0.0
 
     for entry in entries:
         text = entry.text.replace("\n", " ").strip()
-        text = re.sub(r"\s+", " ", text)
+        text = leading_timestamp.sub("", text)
+        text = re.sub(r"\s+", " ", text).strip()
         if not text:
             continue
 
