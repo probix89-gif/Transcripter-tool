@@ -5,6 +5,7 @@ import logging
 import requests
 import edge_tts
 
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, parse_qs
 from typing import Awaitable, Callable
 
@@ -60,13 +61,26 @@ TEST_VIDEO_ID = "dQw4w9WgXcQ"
 # Protocols tried, in order, when the input doesn't specify one explicitly.
 PROXY_SCHEMES_TO_TRY = ["http", "socks5", "socks4"]
 
-# Bulk-checker concurrency. The proxies themselves become the bottleneck past
-# ~100 concurrent sockets, so don't push much higher than this unless you know
-# your provider tolerates it. Tunable via env without editing code.
+# ---- Bulk-checker tuning (all env-tunable) ----------------------------
+# Concurrency: how many proxies are checked in parallel. Above ~100 your
+# proxy provider usually becomes the bottleneck, not the bot.
 MAX_CONCURRENT_PROXY_CHECKS = int(os.environ.get("PROXY_CHECK_CONCURRENCY", "50"))
+
+# Timeouts for the LIGHTWEIGHT bulk check (a single HTTP request per proxy).
+# Dead proxies used to hang for 60s on the transcript API's default timeout;
+# 5s connect / 10s read makes them fail fast and multiplies throughput.
+PROXY_CHECK_CONNECT_TIMEOUT = float(os.environ.get("PROXY_CHECK_CONNECT_TIMEOUT", "5"))
+PROXY_CHECK_READ_TIMEOUT = float(os.environ.get("PROXY_CHECK_READ_TIMEOUT", "10"))
 
 # Delay before the single retry per scheme on transient (non-block) errors.
 PROXY_CHECK_RETRY_DELAY = float(os.environ.get("PROXY_CHECK_RETRY_DELAY", "0.5"))
+
+# Size of the thread pool used to run blocking checks. Must be >= concurrency,
+# otherwise tasks queue behind idle threads and your "50 parallel" runs at 32.
+# Default = 2x concurrency, floored at 64, so there's headroom for retries too.
+PROXY_CHECK_EXECUTOR_WORKERS = int(
+    os.environ.get("PROXY_CHECK_EXECUTOR_WORKERS", str(max(64, MAX_CONCURRENT_PROXY_CHECKS * 2)))
+)
 
 # Minimum seconds between Telegram progress-message edits. Telegram rate-limits
 # edits to roughly 1/sec per chat; 1.5s is safe and still feels live.
@@ -133,9 +147,10 @@ def build_youtube_api() -> YouTubeTranscriptApi:
 
 
 def test_proxy_against_youtube() -> None:
-    """Blocking smoke test: fetch a transcript for a known-good video through
-    whatever proxy is currently ACTIVE (current_proxy). Raises on failure;
-    run via executor. Used by /checkproxy to re-verify what's already set."""
+    """FULL smoke test: fetch a real transcript for a known-good video through
+    whatever proxy is currently ACTIVE. Slow (2-3 requests through the
+    transcript library, 30-60s timeouts) — used only for a single proxy, by
+    /checkproxy and /setproxy verification. Raises on failure; run via executor."""
     ytt_api = build_youtube_api()
     transcript_list = ytt_api.list(TEST_VIDEO_ID)
     try:
@@ -146,19 +161,51 @@ def test_proxy_against_youtube() -> None:
 
 
 def test_proxy_via_urls(http_url: str, https_url: str) -> None:
-    """Same smoke test, but against an arbitrary candidate URL pair without
-    touching global state — used while auto-detecting or bulk-checking so
-    concurrent/trial checks never stomp on the live config. Raises on failure."""
-    from youtube_transcript_api.proxies import GenericProxyConfig
-    ytt_api = YouTubeTranscriptApi(
-        proxy_config=GenericProxyConfig(http_url=http_url or None, https_url=https_url or None)
-    )
-    transcript_list = ytt_api.list(TEST_VIDEO_ID)
+    """
+    LIGHTWEIGHT bulk check: a single HTTP request to YouTube's oembed endpoint
+    through the candidate proxy, with short timeouts.
+
+    Why not use youtube_transcript_api here? Because a full transcript fetch
+    makes 2-3 round trips with 30-60s default timeouts — a dead proxy would
+    hang for a full minute before failing, capping bulk throughput at ~1/s
+    regardless of concurrency. A single short-timeout request fails dead
+    proxies in ~5s and multiplies throughput 10-20x.
+
+    This checks REACHABILITY, not that YouTube will serve a transcript
+    through that particular IP. The winning proxy is re-verified with the
+    full test (test_proxy_against_youtube) before it's activated.
+    """
+    proxies = {}
+    if http_url:
+        proxies["http"] = http_url
+    if https_url:
+        proxies["https"] = https_url
+
     try:
-        transcript = next(iter(transcript_list))
-    except StopIteration as exc:
-        raise RuntimeError("Test video returned no transcript tracks.") from exc
-    transcript.fetch()
+        resp = requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": f"https://youtu.be/{TEST_VIDEO_ID}", "format": "json"},
+            proxies=proxies or None,
+            timeout=(PROXY_CHECK_CONNECT_TIMEOUT, PROXY_CHECK_READ_TIMEOUT),
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+            allow_redirects=True,
+        )
+    except requests.exceptions.ProxyError as exc:
+        raise RuntimeError(f"proxy connect failed: {exc}") from exc
+    except requests.exceptions.ConnectTimeout as exc:
+        raise RuntimeError(f"connect timeout ({PROXY_CHECK_CONNECT_TIMEOUT}s)") from exc
+    except requests.exceptions.ReadTimeout as exc:
+        raise RuntimeError(f"read timeout ({PROXY_CHECK_READ_TIMEOUT}s)") from exc
+    except requests.exceptions.SSLError as exc:
+        raise RuntimeError(f"SSL error: {exc}") from exc
+    except requests.exceptions.ConnectionError as exc:
+        raise RuntimeError(f"connection error: {exc}") from exc
+
+    if resp.status_code == 429:
+        raise RuntimeError("rate-limited by YouTube (proxy reachable but throttled)")
+    if resp.status_code >= 500:
+        raise RuntimeError(f"upstream {resp.status_code}")
+    resp.raise_for_status()
 
 
 def build_generic_proxy_urls(
@@ -283,6 +330,7 @@ async def auto_configure_proxy(
     for scheme in schemes:
         http_url, https_url = build_generic_proxy_urls(host, port, user, password, scheme)
         try:
+            # Use the full test — this is a single proxy, correctness matters.
             await loop.run_in_executor(None, test_proxy_via_urls, http_url, https_url)
         except (RequestBlocked, IpBlocked):
             attempts.append(f"{scheme}:// → blocked by YouTube")
@@ -1238,7 +1286,7 @@ async def run_bulk_proxy_check(
 
     Input:  raw text (one proxy per line, blank lines / # comments allowed)
     Output: clean_proxies.txt (working only) + proxy_check_report.txt (full pass/fail),
-            and the first working proxy is activated.
+            and the first working proxy is activated (after full verification).
     """
     chat = update.effective_chat
 
@@ -1275,7 +1323,8 @@ async def run_bulk_proxy_check(
     total = len(parsed_list)
     header = (
         f"Testing {total} prox{'y' if total == 1 else 'ies'} from {source_label} "
-        f"({MAX_CONCURRENT_PROXY_CHECKS} parallel)"
+        f"({MAX_CONCURRENT_PROXY_CHECKS} parallel, "
+        f"{PROXY_CHECK_CONNECT_TIMEOUT:.0f}s/{PROXY_CHECK_READ_TIMEOUT:.0f}s timeouts)"
     )
     if status_msg:
         await status_msg.edit_text(header)
@@ -1356,17 +1405,35 @@ async def run_bulk_proxy_check(
 
     if working:
         top = working[0]
-        current_proxy.update(
-            type="generic",
-            http_url=top["http_url"],
-            https_url=top["https_url"],
-            webshare_username="",
-            webshare_password="",
+        # The bulk check was a fast reachability screen; before activating,
+        # re-verify the winner with the FULL transcript test so we don't set
+        # a proxy that reaches YouTube but can't actually fetch captions.
+        verify_msg = await chat.send_message(
+            f"Verifying the winner with a full transcript fetch: {top['raw']}…"
         )
-        await chat.send_message(
-            f"🏆 Activated the first working proxy: {top['raw']} (via {top['scheme']}://)\n"
-            "Run /proxystatus to confirm."
-        )
+        try:
+            prev = dict(current_proxy)
+            current_proxy.update(
+                type="generic",
+                http_url=top["http_url"],
+                https_url=top["https_url"],
+                webshare_username="",
+                webshare_password="",
+            )
+            await loop.run_in_executor(None, test_proxy_against_youtube)
+        except Exception as exc:  # noqa: BLE001
+            current_proxy.clear()
+            current_proxy.update(prev)
+            await verify_msg.edit_text(
+                f"⚠️ {top['raw']} passed the reachability screen but failed the full "
+                f"transcript test ({type(exc).__name__}: {exc}).\n"
+                "Try another line from clean_proxies.txt with /setproxy."
+            )
+        else:
+            await verify_msg.edit_text(
+                f"🏆 Activated and fully verified: {top['raw']} (via {top['scheme']}://)\n"
+                "Run /proxystatus to confirm."
+            )
 
 
 async def checkproxies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1574,7 +1641,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def post_init(application: Application) -> None:
-    """Registers the native Telegram '/' command menu and logs startup warnings."""
+    """Registers the native Telegram '/' command menu, resizes the default
+    executor so blocking proxy checks actually run in parallel, and logs
+    startup warnings."""
     await application.bot.set_my_commands([
         BotCommand("start", "Welcome menu with buttons"),
         BotCommand("help", "List everything the bot can do"),
@@ -1593,6 +1662,15 @@ async def post_init(application: Application) -> None:
         BotCommand("checkproxies", "Test a whole list of proxies at once (owner only)"),
     ])
 
+    # Resize the default ThreadPoolExecutor. Without this, loop.run_in_executor(None, ...)
+    # is capped at min(32, cpu+4) threads, so "50 parallel" would still run at ~32.
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(
+        max_workers=PROXY_CHECK_EXECUTOR_WORKERS,
+        thread_name_prefix="proxy-check",
+    )
+    loop.set_default_executor(executor)
+
     if OWNER_ID is None:
         logger.warning(
             "OWNER_ID is not set — /setproxy, /clearproxy and /checkproxies are open "
@@ -1602,8 +1680,11 @@ async def post_init(application: Application) -> None:
     if not NVIDIA_API_KEY:
         logger.info("NVIDIA_API_KEY not set — /translate and /models are disabled.")
     logger.info(
-        "Bulk proxy checker: concurrency=%d, retry_delay=%.1fs, progress_edit=%.1fs",
-        MAX_CONCURRENT_PROXY_CHECKS, PROXY_CHECK_RETRY_DELAY, PROGRESS_EDIT_INTERVAL,
+        "Bulk proxy checker: concurrency=%d, executor_workers=%d, "
+        "timeouts=%.1fs/%.1fs, retry_delay=%.1fs, progress_edit=%.1fs",
+        MAX_CONCURRENT_PROXY_CHECKS, PROXY_CHECK_EXECUTOR_WORKERS,
+        PROXY_CHECK_CONNECT_TIMEOUT, PROXY_CHECK_READ_TIMEOUT,
+        PROXY_CHECK_RETRY_DELAY, PROGRESS_EDIT_INTERVAL,
     )
 
 
