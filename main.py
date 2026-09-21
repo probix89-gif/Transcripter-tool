@@ -28,6 +28,8 @@ from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     NoTranscriptFound,
     VideoUnavailable,
+    RequestBlocked,
+    IpBlocked,
 )
 
 logging.basicConfig(
@@ -37,6 +39,88 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT-YOUR-TOKEN-HERE")
+
+# --- YouTube proxy config (optional, but usually required on a VPS) ----
+# YouTube blocks most cloud/VPS IP ranges from the transcript endpoint.
+# Configurable two ways:
+#   1. Env vars at startup (WEBSHARE_PROXY_USERNAME/PASSWORD or
+#      PROXY_HTTP_URL/PROXY_HTTPS_URL) — persists across restarts.
+#   2. /setproxy in Telegram — changes it live, no restart needed, but
+#      resets to the env-var default if the bot restarts.
+# OWNER_ID locks /setproxy, /clearproxy and /checkproxy to one Telegram
+# user ID — this is server-wide config, not a per-chat preference, so
+# without a lock ANY user of the bot could hijack or disable it.
+OWNER_ID_RAW = os.environ.get("OWNER_ID", "").strip()
+OWNER_ID = int(OWNER_ID_RAW) if OWNER_ID_RAW.isdigit() else None
+
+TEST_VIDEO_ID = "dQw4w9WgXcQ"  # long-stable, always-captioned video used to smoke-test a proxy
+
+# Live, mutable proxy state — starts from env vars, changeable via /setproxy.
+current_proxy = {
+    "type": None,  # None | "webshare" | "generic"
+    "webshare_username": os.environ.get("WEBSHARE_PROXY_USERNAME", ""),
+    "webshare_password": os.environ.get("WEBSHARE_PROXY_PASSWORD", ""),
+    "http_url": os.environ.get("PROXY_HTTP_URL", ""),
+    "https_url": os.environ.get("PROXY_HTTPS_URL", ""),
+}
+if current_proxy["webshare_username"] and current_proxy["webshare_password"]:
+    current_proxy["type"] = "webshare"
+elif current_proxy["http_url"] or current_proxy["https_url"]:
+    current_proxy["type"] = "generic"
+
+
+def is_owner(update: Update) -> bool:
+    """No OWNER_ID configured = single-user/personal bot, anyone can manage the proxy."""
+    if OWNER_ID is None:
+        return True
+    return bool(update.effective_user) and update.effective_user.id == OWNER_ID
+
+
+def describe_current_proxy(reveal: bool = False) -> str:
+    if current_proxy["type"] == "webshare":
+        user = current_proxy["webshare_username"] or "(unset)"
+        if not reveal and len(user) > 4:
+            user = user[:2] + "…" + user[-2:]
+        return f"Webshare ({user})"
+    if current_proxy["type"] == "generic":
+        url = current_proxy["http_url"] or current_proxy["https_url"] or "(unset)"
+        if not reveal:
+            url = re.sub(r"//[^@]+@", "//***:***@", url)  # mask user:pass@ in the URL
+        return f"Generic ({url})"
+    return "None — connecting directly"
+
+
+def build_youtube_api() -> YouTubeTranscriptApi:
+    """Instance YouTubeTranscriptApi, proxied per the current live config."""
+    if current_proxy["type"] == "webshare":
+        from youtube_transcript_api.proxies import WebshareProxyConfig
+        return YouTubeTranscriptApi(
+            proxy_config=WebshareProxyConfig(
+                proxy_username=current_proxy["webshare_username"],
+                proxy_password=current_proxy["webshare_password"],
+            )
+        )
+    if current_proxy["type"] == "generic":
+        from youtube_transcript_api.proxies import GenericProxyConfig
+        return YouTubeTranscriptApi(
+            proxy_config=GenericProxyConfig(
+                http_url=current_proxy["http_url"] or None,
+                https_url=current_proxy["https_url"] or None,
+            )
+        )
+    return YouTubeTranscriptApi()
+
+
+def test_proxy_against_youtube() -> None:
+    """Blocking smoke test: fetch a transcript for a known-good video through
+    whatever proxy is currently configured. Raises on failure; run via executor."""
+    ytt_api = build_youtube_api()
+    transcript_list = ytt_api.list(TEST_VIDEO_ID)
+    transcript = next(iter(transcript_list))
+    transcript.fetch()
+
+
+
 
 # --- NVIDIA NIM (translation) config -----------------------------------
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
@@ -164,7 +248,7 @@ def fetch_transcript_text(video_id: str, preferred_langs=("en",)) -> tuple[str, 
     first, then falls back to auto-generated ones, in the preferred
     languages, then finally whatever is available.
     """
-    ytt_api = YouTubeTranscriptApi()
+    ytt_api = build_youtube_api()
     transcript_list = ytt_api.list(video_id)
 
     transcript = None
@@ -254,6 +338,15 @@ async def fetch_transcript_or_report(chat, status_msg, url: str) -> tuple[str, s
         return None
     except VideoUnavailable:
         await status_msg.edit_text("That video is unavailable (private, deleted, or region-locked).")
+        return None
+    except (RequestBlocked, IpBlocked):
+        await status_msg.edit_text(
+            "YouTube is blocking this server's IP address — very common when a bot "
+            "runs on a VPS/cloud host. This isn't a one-off, it'll keep happening "
+            "until a proxy is set.\n\n"
+            "Fix: /setproxy webshare <username> <password> (or /setproxy generic "
+            "<http_url>), then /checkproxy to confirm it actually works."
+        )
         return None
     except Exception as exc:  # noqa: BLE001 - surface unexpected errors to the user
         logger.exception("Transcript fetch failed for %s", video_id)
@@ -565,7 +658,13 @@ HELP_TEXT = (
     "/voice — narrate the last transcript/translation as .mp3\n"
     "/voices <filter> — browse voices, e.g. /voices en-US\n"
     "/setvoice <voice_id> — pick which voice to narrate with\n\n"
-    "/settings — see and change your current model & voice"
+    "/settings — see and change your current model & voice\n\n"
+    "Proxy (only needed if YouTube blocks this server's IP):\n"
+    "/proxystatus — show the current proxy\n"
+    "/setproxy webshare <user> <pass> — set a Webshare proxy\n"
+    "/setproxy generic <http_url> [https_url] — set any other proxy\n"
+    "/clearproxy — go back to a direct connection\n"
+    "/checkproxy — test the current proxy against YouTube"
 )
 
 
@@ -660,6 +759,97 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await send_settings_message(update, context)
 
 
+async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update):
+        await update.message.reply_text("Only the bot owner can change the proxy.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/setproxy webshare <username> <password>\n"
+            "/setproxy generic <http_url> [https_url]\n"
+            "/clearproxy — go back to a direct connection\n"
+            "/checkproxy — test the current proxy against YouTube\n\n"
+            f"Current: {describe_current_proxy()}"
+        )
+        return
+
+    mode = args[0].lower()
+
+    if mode == "webshare":
+        if len(args) < 3:
+            await update.message.reply_text("Usage: /setproxy webshare <username> <password>")
+            return
+        current_proxy["type"] = "webshare"
+        current_proxy["webshare_username"] = args[1]
+        current_proxy["webshare_password"] = args[2]
+        await update.message.reply_text(
+            f"Webshare proxy set: {describe_current_proxy()}\n"
+            "Run /checkproxy to confirm it actually works before relying on it.\n\n"
+            "⚠️ Your credentials are now in this chat's message history — delete "
+            "your /setproxy message if others can read this chat."
+        )
+        return
+
+    if mode == "generic":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /setproxy generic <http_url> [https_url]")
+            return
+        current_proxy["type"] = "generic"
+        current_proxy["http_url"] = args[1]
+        current_proxy["https_url"] = args[2] if len(args) > 2 else args[1]
+        await update.message.reply_text(
+            f"Generic proxy set: {describe_current_proxy()}\n"
+            "Run /checkproxy to confirm it actually works before relying on it.\n\n"
+            "⚠️ Your credentials are now in this chat's message history — delete "
+            "your /setproxy message if others can read this chat."
+        )
+        return
+
+    await update.message.reply_text("Unknown mode. Use: webshare, generic. Or /clearproxy to disable.")
+
+
+async def clearproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update):
+        await update.message.reply_text("Only the bot owner can change the proxy.")
+        return
+    current_proxy.update(type=None, webshare_username="", webshare_password="", http_url="", https_url="")
+    await update.message.reply_text("Proxy cleared — requests will connect to YouTube directly.")
+
+
+async def proxystatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(f"Current proxy: {describe_current_proxy()}")
+
+
+async def checkproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update):
+        await update.message.reply_text("Only the bot owner can run this.")
+        return
+
+    chat = update.effective_chat
+    proxy_desc = describe_current_proxy()
+    status_msg = await chat.send_message(f"Testing against YouTube via: {proxy_desc}…")
+
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, test_proxy_against_youtube)
+    except (RequestBlocked, IpBlocked) as exc:
+        await status_msg.edit_text(
+            f"❌ Still blocked using {proxy_desc}.\n\n{exc}\n\n"
+            "This proxy/IP doesn't work for YouTube — try a different provider "
+            "or a fresh rotating-residential plan."
+        )
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Proxy check failed")
+        await status_msg.edit_text(f"❌ Test failed via {proxy_desc}:\n{exc}")
+        return
+
+    await status_msg.edit_text(f"✅ Working — successfully fetched a test transcript via: {proxy_desc}")
+
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -747,6 +937,10 @@ async def post_init(application: Application) -> None:
         BotCommand("voices", "Browse edge-tts voices"),
         BotCommand("setvoice", "Set the narration voice"),
         BotCommand("settings", "View/change model & voice"),
+        BotCommand("setproxy", "Configure a proxy for YouTube (owner only)"),
+        BotCommand("clearproxy", "Disable the proxy (owner only)"),
+        BotCommand("proxystatus", "Show the current proxy"),
+        BotCommand("checkproxy", "Test the proxy against YouTube (owner only)"),
     ])
 
 
@@ -768,6 +962,10 @@ def main() -> None:
     app.add_handler(CommandHandler("setvoice", setvoice_command))
     app.add_handler(CommandHandler("voice", voice_command))
     app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("setproxy", setproxy_command))
+    app.add_handler(CommandHandler("clearproxy", clearproxy_command))
+    app.add_handler(CommandHandler("proxystatus", proxystatus_command))
+    app.add_handler(CommandHandler("checkproxy", checkproxy_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
