@@ -50,9 +50,10 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 #      PROXY_HTTP_URL/PROXY_HTTPS_URL) — persists across restarts.
 #   2. /setproxy in Telegram — changes it live, no restart needed, but
 #      resets to the env-var default if the bot restarts.
-# OWNER_ID locks /setproxy, /clearproxy and /checkproxy to one Telegram
-# user ID — this is server-wide config, not a per-chat preference, so
-# without a lock ANY user of the bot could hijack or disable it.
+# OWNER_ID locks /setproxy, /clearproxy, /checkproxy, /checkproxies and
+# /stop to one Telegram user ID — this is server-wide config, not a
+# per-chat preference, so without a lock ANY user of the bot could
+# hijack or disable it.
 OWNER_ID_RAW = os.environ.get("OWNER_ID", "").strip()
 OWNER_ID = int(OWNER_ID_RAW) if OWNER_ID_RAW.isdigit() else None
 
@@ -1075,10 +1076,12 @@ HELP_TEXT = (
     "/settings — see and change your current model & voice\n\n"
     "Proxy (only needed if YouTube blocks this server's IP):\n"
     "The reliable way: just upload a .txt file with one proxy per line. "
-    "I'll test them all (with a live progress bar and a 🛑 Stop button), "
-    "activate the first working one, and send back:\n"
+    "I'll test them all (with a live progress bar), activate the first "
+    "working one, and send back:\n"
     "  • clean_proxies.txt — only the working ones\n"
     "  • proxy_check_report.txt — full pass/fail with reasons\n\n"
+    "To cancel a running proxy check: tap the 🛑 Stop button on the progress "
+    "message, or send /stop.\n\n"
     "/setproxy <anything> — auto-detect a single proxy and set it\n"
     "/checkproxies <list> — test a short inline list\n"
     "/proxystatus — show the current proxy\n"
@@ -1183,6 +1186,32 @@ async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_settings_message(update, context)
+
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel the running bulk proxy check. Same effect as tapping the
+    🛑 Stop button on the progress message — this is just a typed
+    alternative that works even if the progress message has scrolled away."""
+    if not is_owner(update):
+        await update.message.reply_text("Only the bot owner can stop a run.")
+        return
+
+    run = context.chat_data.get("bulk_proxy_run")
+    if not run:
+        await update.message.reply_text("No bulk proxy check is running right now.")
+        return
+
+    if run["stop"].is_set():
+        await update.message.reply_text("Already stopping — give it a couple of seconds.")
+        return
+
+    run["stop"].set()
+    await update.message.reply_text(
+        "🛑 Stopping the proxy check…\n"
+        "In-flight requests will finish within their timeouts, then the "
+        "partial results will still be saved to clean_proxies.txt + "
+        "proxy_check_report.txt."
+    )
 
 
 async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1347,9 +1376,8 @@ async def run_bulk_proxy_check(
     Input:  raw text (one proxy per line, blank lines / # comments allowed)
     Output: clean_proxies.txt (working only) + proxy_check_report.txt (full pass/fail),
             and the first working proxy is activated (after full verification).
-    The progress message carries a 🛑 Stop button; pressing it sets a stop
-    event, short-circuits every queued check, and still produces both files
-    from whatever was already tested.
+    The run can be cancelled by either the 🛑 Stop inline button on the
+    progress message or the /stop command — both flip the same stop event.
     """
     chat = update.effective_chat
 
@@ -1387,11 +1415,13 @@ async def run_bulk_proxy_check(
     header = (
         f"Testing {total} prox{'y' if total == 1 else 'ies'} from {source_label} "
         f"({MAX_CONCURRENT_PROXY_CHECKS} parallel, "
-        f"{PROXY_CHECK_CONNECT_TIMEOUT:.0f}s/{PROXY_CHECK_READ_TIMEOUT:.0f}s timeouts)"
+        f"{PROXY_CHECK_CONNECT_TIMEOUT:.0f}s/{PROXY_CHECK_READ_TIMEOUT:.0f}s timeouts)\n"
+        f"Tap 🛑 Stop below or send /stop to cancel."
     )
 
-    # Register the run so the Stop button has something to flip. A fresh run_id
-    # makes sure a stale button from an earlier run can't cancel this one.
+    # Register the run so both the Stop button and /stop have something to flip.
+    # A fresh run_id makes sure a stale button from an earlier run can't cancel
+    # this one.
     run_id = secrets.token_hex(4)
     stop_event = asyncio.Event()
     context.chat_data["bulk_proxy_run"] = {"id": run_id, "stop": stop_event}
@@ -1419,8 +1449,8 @@ async def run_bulk_proxy_check(
         results = await asyncio.gather(*(one(raw, p) for raw, p in parsed_list))
     finally:
         # Whether we finished or got cancelled, clear the run registration so
-        # the stop button (which is about to disappear anyway) has nothing to
-        # flip, and so a new run can start cleanly.
+        # /stop and the stop button have nothing to flip after the fact, and
+        # so a new run can start cleanly.
         context.chat_data.pop("bulk_proxy_run", None)
 
     was_stopped = stop_event.is_set()
@@ -1542,8 +1572,8 @@ async def checkproxies_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(
             "Easiest way: just upload a .txt file with one proxy per line — "
             "you'll get back clean_proxies.txt containing only the working ones, "
-            "plus a full proxy_check_report.txt. The progress message has a "
-            "🛑 Stop button to cancel mid-run.\n\n"
+            "plus a full proxy_check_report.txt. Cancel mid-run with the 🛑 Stop "
+            "button on the progress message or by sending /stop.\n\n"
             "Or paste a short list inline (comma, semicolon, or newline separated):\n"
             "/checkproxies 31.59.20.176:6754:user:pass, 45.12.13.14:8080:u2:p2"
         )
@@ -1769,6 +1799,7 @@ async def post_init(application: Application) -> None:
         BotCommand("proxystatus", "Show the current proxy"),
         BotCommand("checkproxy", "Test the proxy against YouTube (owner only)"),
         BotCommand("checkproxies", "Test a whole list of proxies at once (owner only)"),
+        BotCommand("stop", "Cancel the running bulk proxy check (owner only)"),
     ])
 
     # Resize the default ThreadPoolExecutor. Without this, loop.run_in_executor(None, ...)
@@ -1782,9 +1813,9 @@ async def post_init(application: Application) -> None:
 
     if OWNER_ID is None:
         logger.warning(
-            "OWNER_ID is not set — /setproxy, /clearproxy and /checkproxies are open "
-            "to ANY user of this bot. Set OWNER_ID to your numeric Telegram user ID "
-            "to lock them down."
+            "OWNER_ID is not set — /setproxy, /clearproxy, /checkproxies and /stop "
+            "are open to ANY user of this bot. Set OWNER_ID to your numeric Telegram "
+            "user ID to lock them down."
         )
     if not NVIDIA_API_KEY:
         logger.info("NVIDIA_API_KEY not set — /translate and /models are disabled.")
@@ -1820,6 +1851,7 @@ def main() -> None:
     app.add_handler(CommandHandler("proxystatus", proxystatus_command))
     app.add_handler(CommandHandler("checkproxy", checkproxy_command))
     app.add_handler(CommandHandler("checkproxies", checkproxies_command))
+    app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, proxy_file_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
