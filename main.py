@@ -55,6 +55,13 @@ OWNER_ID = int(OWNER_ID_RAW) if OWNER_ID_RAW.isdigit() else None
 
 TEST_VIDEO_ID = "dQw4w9WgXcQ"  # long-stable, always-captioned video used to smoke-test a proxy
 
+TEST_VIDEO_ID = "dQw4w9WgXcQ"  # long-stable, always-captioned video used to smoke-test a proxy
+
+# Protocols tried, in order, when the input doesn't specify one explicitly.
+PROXY_SCHEMES_TO_TRY = ["http", "socks5", "socks4"]
+
+MAX_CONCURRENT_PROXY_CHECKS = 5  # cap for /checkproxies so a big list doesn't hammer everything at once
+
 # Live, mutable proxy state — starts from env vars, changeable via /setproxy.
 current_proxy = {
     "type": None,  # None | "webshare" | "generic"
@@ -113,11 +120,113 @@ def build_youtube_api() -> YouTubeTranscriptApi:
 
 def test_proxy_against_youtube() -> None:
     """Blocking smoke test: fetch a transcript for a known-good video through
-    whatever proxy is currently configured. Raises on failure; run via executor."""
+    whatever proxy is currently ACTIVE (current_proxy). Raises on failure;
+    run via executor. Used by /checkproxy to re-verify what's already set."""
     ytt_api = build_youtube_api()
     transcript_list = ytt_api.list(TEST_VIDEO_ID)
     transcript = next(iter(transcript_list))
     transcript.fetch()
+
+
+def test_proxy_via_urls(http_url: str, https_url: str) -> None:
+    """Same smoke test, but against an arbitrary candidate URL pair without
+    touching global state — used while auto-detecting or bulk-checking so
+    concurrent/trial checks never stomp on the live config. Raises on failure."""
+    from youtube_transcript_api.proxies import GenericProxyConfig
+    ytt_api = YouTubeTranscriptApi(
+        proxy_config=GenericProxyConfig(http_url=http_url or None, https_url=https_url or None)
+    )
+    transcript_list = ytt_api.list(TEST_VIDEO_ID)
+    transcript = next(iter(transcript_list))
+    transcript.fetch()
+
+
+def build_generic_proxy_urls(host: str, port: str, user: str | None, password: str | None, scheme: str) -> tuple[str, str]:
+    auth = f"{user}:{password}@" if user and password else ""
+    url = f"{scheme}://{auth}{host}:{port}"
+    return url, url
+
+
+def parse_proxy_input(raw: str) -> tuple[str, str, str | None, str | None, str | None] | None:
+    """
+    Auto-detect a wide range of common proxy string shapes. Returns
+    (host, port, username_or_None, password_or_None, forced_scheme_or_None)
+    on success, or None if the string isn't recognizable as a proxy at all.
+    forced_scheme is set only when the input already specified one (a full
+    scheme://... URL) — otherwise every scheme in PROXY_SCHEMES_TO_TRY is
+    worth trying, since a bare host:port:user:pass doesn't say which one it is.
+    """
+    raw = raw.strip().strip("'\"")
+
+    # A full URL: scheme://[user:pass@]host:port
+    url_match = re.match(
+        r"^(?P<scheme>https?|socks5|socks4)://(?:(?P<user>[^:@\s]+):(?P<pw>[^:@\s]+)@)?"
+        r"(?P<host>[\w.\-]+):(?P<port>\d{2,5})/?$",
+        raw,
+        re.IGNORECASE,
+    )
+    if url_match:
+        d = url_match.groupdict()
+        return d["host"], d["port"], d.get("user"), d.get("pw"), d["scheme"].lower()
+
+    parts = raw.split(":")
+
+    if len(parts) == 4:
+        a, b, c, d = parts
+        if b.isdigit():
+            return a, b, c, d, None  # host:port:user:pass
+        if d.isdigit():
+            return c, d, a, b, None  # user:pass:host:port
+        return None
+
+    if len(parts) == 2 and parts[1].isdigit():
+        return parts[0], parts[1], None, None, None  # host:port, no auth
+
+    # user:pass@host:port
+    at_match = re.match(r"^([^:@\s]+):([^:@\s]+)@([\w.\-]+):(\d{2,5})$", raw)
+    if at_match:
+        user, password, host, port = at_match.groups()
+        return host, port, user, password, None
+
+    return None
+
+
+async def auto_configure_proxy(chat, host: str, port: str, user: str | None, password: str | None, forced_scheme: str | None = None):
+    """
+    Try each candidate protocol (or just the one the input specified) against
+    a live YouTube fetch, and activate the first one that actually works.
+    Global state is untouched until a working scheme is confirmed.
+    """
+    schemes = [forced_scheme] if forced_scheme else PROXY_SCHEMES_TO_TRY
+    status_msg = await chat.send_message(f"Auto-detecting proxy protocol for {host}:{port}…")
+
+    loop = asyncio.get_running_loop()
+    attempts = []
+    for scheme in schemes:
+        http_url, https_url = build_generic_proxy_urls(host, port, user, password, scheme)
+        try:
+            await loop.run_in_executor(None, test_proxy_via_urls, http_url, https_url)
+        except (RequestBlocked, IpBlocked):
+            attempts.append(f"{scheme}:// → blocked by YouTube")
+            continue
+        except Exception as exc:  # noqa: BLE001
+            attempts.append(f"{scheme}:// → {type(exc).__name__}: {exc}")
+            continue
+
+        current_proxy.update(
+            type="generic", http_url=http_url, https_url=https_url,
+            webshare_username="", webshare_password="",
+        )
+        await status_msg.edit_text(
+            f"✅ Working via {scheme}:// — proxy set: {describe_current_proxy()}"
+        )
+        return
+
+    report = "\n".join(attempts)
+    await status_msg.edit_text(
+        f"❌ {host}:{port} didn't work on {'/'.join(schemes)}:\n\n{report}\n\n"
+        "Try a different proxy, or double-check the credentials."
+    )
 
 
 
@@ -661,10 +770,11 @@ HELP_TEXT = (
     "/settings — see and change your current model & voice\n\n"
     "Proxy (only needed if YouTube blocks this server's IP):\n"
     "/proxystatus — show the current proxy\n"
-    "/setproxy webshare <user> <pass> — set a Webshare proxy\n"
-    "/setproxy generic <http_url> [https_url] — set any other proxy\n"
+    "/setproxy <anything> — paste a proxy in almost any format, I'll "
+    "auto-detect it, try protocols, and verify it live\n"
+    "/checkproxies <list> — test a whole list at once, one per line\n"
     "/clearproxy — go back to a direct connection\n"
-    "/checkproxy — test the current proxy against YouTube"
+    "/checkproxy — re-verify the current proxy"
 )
 
 
@@ -767,48 +877,164 @@ async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     args = context.args
     if not args:
         await update.message.reply_text(
-            "Usage:\n"
+            "Paste a proxy in ANY common shape and I'll auto-detect the format "
+            "and protocol, then verify it against YouTube before activating it:\n"
+            "• host:port:username:password\n"
+            "• username:password@host:port\n"
+            "• host:port (no auth)\n"
+            "• scheme://user:pass@host:port (http/https/socks5/socks4)\n\n"
+            "Or be explicit:\n"
             "/setproxy webshare <username> <password>\n"
-            "/setproxy generic <http_url> [https_url]\n"
+            "/setproxy generic <http_url> [https_url]\n\n"
             "/clearproxy — go back to a direct connection\n"
-            "/checkproxy — test the current proxy against YouTube\n\n"
+            "/checkproxy — re-verify the current proxy\n"
+            "/checkproxies <list> — test many proxies at once (one per line)\n\n"
             f"Current: {describe_current_proxy()}"
         )
         return
 
     mode = args[0].lower()
+    chat = update.effective_chat
 
     if mode == "webshare":
         if len(args) < 3:
             await update.message.reply_text("Usage: /setproxy webshare <username> <password>")
             return
-        current_proxy["type"] = "webshare"
-        current_proxy["webshare_username"] = args[1]
-        current_proxy["webshare_password"] = args[2]
-        await update.message.reply_text(
-            f"Webshare proxy set: {describe_current_proxy()}\n"
-            "Run /checkproxy to confirm it actually works before relying on it.\n\n"
-            "⚠️ Your credentials are now in this chat's message history — delete "
-            "your /setproxy message if others can read this chat."
+        user, password = args[1], args[2]
+        previous = dict(current_proxy)
+        current_proxy.update(
+            type="webshare", webshare_username=user, webshare_password=password,
+            http_url="", https_url="",
         )
+        status_msg = await chat.send_message(f"Testing Webshare ({user}) against YouTube…")
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, test_proxy_against_youtube)
+        except Exception as exc:  # noqa: BLE001
+            current_proxy.clear()
+            current_proxy.update(previous)
+            await status_msg.edit_text(f"❌ Didn't work: {type(exc).__name__}: {exc}\nReverted.")
+            return
+        await status_msg.edit_text(f"✅ Working — proxy set: {describe_current_proxy()}")
         return
 
     if mode == "generic":
         if len(args) < 2:
             await update.message.reply_text("Usage: /setproxy generic <http_url> [https_url]")
             return
-        current_proxy["type"] = "generic"
-        current_proxy["http_url"] = args[1]
-        current_proxy["https_url"] = args[2] if len(args) > 2 else args[1]
+        http_url = args[1]
+        https_url = args[2] if len(args) > 2 else args[1]
+        previous = dict(current_proxy)
+        current_proxy.update(
+            type="generic", http_url=http_url, https_url=https_url,
+            webshare_username="", webshare_password="",
+        )
+        status_msg = await chat.send_message("Testing generic proxy against YouTube…")
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, test_proxy_against_youtube)
+        except Exception as exc:  # noqa: BLE001
+            current_proxy.clear()
+            current_proxy.update(previous)
+            await status_msg.edit_text(f"❌ Didn't work: {type(exc).__name__}: {exc}\nReverted.")
+            return
+        await status_msg.edit_text(f"✅ Working — proxy set: {describe_current_proxy()}")
+        return
+
+    # Anything else: auto-detect. Accept one token, or several space-separated
+    # fields (host port user pass) that some providers export instead of colons.
+    candidate = args[0] if len(args) == 1 else ":".join(args)
+    parsed = parse_proxy_input(candidate)
+    if parsed is None:
         await update.message.reply_text(
-            f"Generic proxy set: {describe_current_proxy()}\n"
-            "Run /checkproxy to confirm it actually works before relying on it.\n\n"
-            "⚠️ Your credentials are now in this chat's message history — delete "
-            "your /setproxy message if others can read this chat."
+            "Couldn't recognize that format. Paste it exactly as your provider gave "
+            "it to you, or be explicit with /setproxy webshare <user> <pass> or "
+            "/setproxy generic <http_url>."
         )
         return
 
-    await update.message.reply_text("Unknown mode. Use: webshare, generic. Or /clearproxy to disable.")
+    host, port, user, password, forced_scheme = parsed
+    await auto_configure_proxy(chat, host, port, user, password, forced_scheme)
+
+
+async def checkproxies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update):
+        await update.message.reply_text("Only the bot owner can run this.")
+        return
+
+    raw_candidates = context.args
+    if not raw_candidates:
+        await update.message.reply_text(
+            "Paste a list of proxies after the command, one per line (or "
+            "space-separated) — any mix of the formats /setproxy accepts. "
+            "The first one that works gets activated automatically. Example:\n\n"
+            "/checkproxies\n"
+            "31.59.20.176:6754:hmpbjiqx:wrn4o46h9o68\n"
+            "45.12.13.14:8080:user2:pass2\n"
+            "user3:pass3@66.7.8.9:3128"
+        )
+        return
+
+    parsed_list = []
+    unparsed = []
+    for raw in raw_candidates:
+        parsed = parse_proxy_input(raw)
+        if parsed is None:
+            unparsed.append(raw)
+        else:
+            parsed_list.append((raw, parsed))
+
+    if not parsed_list:
+        await update.message.reply_text("None of those looked like a proxy I could parse.")
+        return
+
+    status_msg = await update.message.reply_text(
+        f"Testing {len(parsed_list)} prox{'y' if len(parsed_list) == 1 else 'ies'} "
+        f"against YouTube (only the default protocol per entry — this can take a bit)…"
+    )
+
+    loop = asyncio.get_running_loop()
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_PROXY_CHECKS)
+
+    async def check_one(raw: str, parsed):
+        host, port, user, password, forced_scheme = parsed
+        scheme = forced_scheme or "http"
+        http_url, https_url = build_generic_proxy_urls(host, port, user, password, scheme)
+        async with semaphore:
+            try:
+                await loop.run_in_executor(None, test_proxy_via_urls, http_url, https_url)
+                return raw, scheme, http_url, https_url, True, None
+            except Exception as exc:  # noqa: BLE001
+                return raw, scheme, http_url, https_url, False, f"{type(exc).__name__}: {exc}"
+
+    results = await asyncio.gather(*(check_one(raw, parsed) for raw, parsed in parsed_list))
+    working = [r for r in results if r[4]]
+
+    lines = [f"Tested {len(results)} prox{'y' if len(results) == 1 else 'ies'}:\n"]
+    for raw, scheme, _http_url, _https_url, ok, err in results:
+        lines.append(f"{'✅' if ok else '❌'} {raw}" + ("" if ok else f" — {err}"))
+    if unparsed:
+        lines.append("\nCouldn't parse:\n" + "\n".join(unparsed))
+
+    report = "\n".join(lines)
+    first_chunk, *rest_chunks = [report[i : i + 3800] for i in range(0, len(report), 3800)] or [""]
+    await status_msg.edit_text(first_chunk)
+    for chunk in rest_chunks:
+        await update.message.reply_text(chunk)
+
+    if working:
+        raw, scheme, http_url, https_url, _, _ = working[0]
+        current_proxy.update(
+            type="generic", http_url=http_url, https_url=https_url,
+            webshare_username="", webshare_password="",
+        )
+        await update.message.reply_text(
+            f"🏆 Activated the first working one: {raw} (via {scheme}://)\n"
+            "Run /proxystatus to confirm, or /setproxy a different entry from the "
+            "list above if you'd rather use another."
+        )
+    else:
+        await update.message.reply_text("None of them worked against YouTube.")
 
 
 async def clearproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -941,6 +1167,7 @@ async def post_init(application: Application) -> None:
         BotCommand("clearproxy", "Disable the proxy (owner only)"),
         BotCommand("proxystatus", "Show the current proxy"),
         BotCommand("checkproxy", "Test the proxy against YouTube (owner only)"),
+        BotCommand("checkproxies", "Test a whole list of proxies at once (owner only)"),
     ])
 
 
@@ -966,6 +1193,7 @@ def main() -> None:
     app.add_handler(CommandHandler("clearproxy", clearproxy_command))
     app.add_handler(CommandHandler("proxystatus", proxystatus_command))
     app.add_handler(CommandHandler("checkproxy", checkproxy_command))
+    app.add_handler(CommandHandler("checkproxies", checkproxies_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
