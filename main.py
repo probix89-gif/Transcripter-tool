@@ -1,5 +1,6 @@
 import os
 import re
+import secrets
 import asyncio
 import logging
 import requests
@@ -451,6 +452,15 @@ def build_settings_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def build_stop_keyboard(run_id: str) -> InlineKeyboardMarkup:
+    """Inline keyboard attached to the bulk-check progress message so a long
+    run can be cancelled with one tap. run_id makes sure a stale button from
+    an earlier (already-finished) run can't stop the current one."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🛑 Stop", callback_data=f"stopbulk:{run_id}")
+    ]])
+
+
 # --- Text chunking for Telegram's 4096-char message cap -----------------
 
 def chunk_lines(lines: list[str], max_chars: int = 3800) -> list[str]:
@@ -486,34 +496,59 @@ class ProgressTracker:
     Edits the status message at most once every PROGRESS_EDIT_INTERVAL seconds
     so a large run doesn't trip Telegram's edit rate limit but still looks
     live. The final tick always forces an edit so the bar lands on 100%.
+    When a stop_event is supplied and fires, the very next tick bypasses the
+    throttle so the message immediately reflects "stopping".
     """
 
-    def __init__(self, total: int, status_msg, header: str):
+    def __init__(
+        self,
+        total: int,
+        status_msg,
+        header: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+        stop_event: asyncio.Event | None = None,
+    ):
         self.total = total
         self.status_msg = status_msg
         self.header = header
+        self.reply_markup = reply_markup
+        self.stop_event = stop_event
         self.done = 0
         self.passed = 0
         self.failed = 0
+        self.skipped = 0
         self.started = asyncio.get_running_loop().time()
         self._lock = asyncio.Lock()
         self._last_edit = 0.0
+        self._showed_stopping = False
 
-    async def tick(self, ok: bool) -> None:
+    async def tick(self, ok: bool, skipped: bool = False) -> None:
         async with self._lock:
             self.done += 1
-            if ok:
+            if skipped:
+                self.skipped += 1
+            elif ok:
                 self.passed += 1
             else:
                 self.failed += 1
+
             now = asyncio.get_running_loop().time()
             is_last = self.done >= self.total
-            if not is_last and (now - self._last_edit) < PROGRESS_EDIT_INTERVAL:
+            stopping_now = self.stop_event is not None and self.stop_event.is_set()
+            just_started_stopping = stopping_now and not self._showed_stopping
+            if just_started_stopping:
+                self._showed_stopping = True
+
+            if (
+                not is_last
+                and not just_started_stopping
+                and (now - self._last_edit) < PROGRESS_EDIT_INTERVAL
+            ):
                 return
             self._last_edit = now
 
         try:
-            await self.status_msg.edit_text(self._render())
+            await self.status_msg.edit_text(self._render(), reply_markup=self.reply_markup)
         except Exception:
             pass  # message edited/deleted elsewhere — never fatal
 
@@ -529,12 +564,18 @@ class ProgressTracker:
         remaining = self.total - self.done
         eta = remaining / rate if rate > 0 else 0.0
 
-        return (
-            f"{self.header}\n\n"
-            f"`[{bar}]` {pct:5.1f}%\n"
-            f"✅ {self.passed} working   ❌ {self.failed} failed\n"
-            f"⚡ {rate:0.1f}/s   ⏳ ETA {format_duration(eta)}"
-        )
+        lines = [
+            self.header,
+            "",
+            f"`[{bar}]` {pct:5.1f}%",
+            f"✅ {self.passed} working   ❌ {self.failed} failed",
+            f"⚡ {rate:0.1f}/s   ⏳ ETA {format_duration(eta)}",
+        ]
+        if self.skipped:
+            lines.append(f"⏭ {self.skipped} skipped")
+        if self.stop_event is not None and self.stop_event.is_set():
+            lines.append("🛑 Stopping…")
+        return "\n".join(lines)
 
 
 # --- YouTube transcript helpers ---------------------------------------
@@ -1034,8 +1075,8 @@ HELP_TEXT = (
     "/settings — see and change your current model & voice\n\n"
     "Proxy (only needed if YouTube blocks this server's IP):\n"
     "The reliable way: just upload a .txt file with one proxy per line. "
-    "I'll test them all (with a live progress bar), activate the first "
-    "working one, and send back:\n"
+    "I'll test them all (with a live progress bar and a 🛑 Stop button), "
+    "activate the first working one, and send back:\n"
     "  • clean_proxies.txt — only the working ones\n"
     "  • proxy_check_report.txt — full pass/fail with reasons\n\n"
     "/setproxy <anything> — auto-detect a single proxy and set it\n"
@@ -1236,7 +1277,11 @@ async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # ----------------------------------------------------------------------
 
 async def check_proxy_candidate(
-    loop, semaphore: asyncio.Semaphore, raw: str, parsed
+    loop,
+    semaphore: asyncio.Semaphore,
+    raw: str,
+    parsed,
+    stop_event: asyncio.Event | None = None,
 ) -> dict:
     """
     Test one proxy candidate reliably: try every viable protocol (or just the
@@ -1244,18 +1289,33 @@ async def check_proxy_candidate(
     smooth over transient network blips. A definitive YouTube block is NOT
     retried (retrying won't change a hard block) — everything else gets a
     second attempt before being marked failed.
+
+    If stop_event is set at any checkpoint, returns immediately with
+    skipped=True so a stopped run drains its queue in near-zero time.
     """
+    def _skipped() -> dict:
+        return {
+            "raw": raw, "ok": False, "skipped": True, "scheme": None,
+            "http_url": None, "https_url": None, "note": "stopped",
+        }
+
     host, port, user, password, forced_scheme = parsed
     schemes = [forced_scheme] if forced_scheme else PROXY_SCHEMES_TO_TRY
     attempts = []
     async with semaphore:
+        if stop_event is not None and stop_event.is_set():
+            return _skipped()
         for scheme in schemes:
+            if stop_event is not None and stop_event.is_set():
+                return _skipped()
             http_url, https_url = build_generic_proxy_urls(host, port, user, password, scheme)
             for attempt_num in (1, 2):
+                if stop_event is not None and stop_event.is_set():
+                    return _skipped()
                 try:
                     await loop.run_in_executor(None, test_proxy_via_urls, http_url, https_url)
                     return {
-                        "raw": raw, "ok": True, "scheme": scheme,
+                        "raw": raw, "ok": True, "skipped": False, "scheme": scheme,
                         "http_url": http_url, "https_url": https_url,
                         "note": f"working via {scheme}://",
                     }
@@ -1268,7 +1328,7 @@ async def check_proxy_candidate(
                         continue
                     attempts.append(f"{scheme}:// → {type(exc).__name__}: {exc}")
     return {
-        "raw": raw, "ok": False, "scheme": None,
+        "raw": raw, "ok": False, "skipped": False, "scheme": None,
         "http_url": None, "https_url": None,
         "note": "; ".join(attempts) or "no working protocol",
     }
@@ -1287,6 +1347,9 @@ async def run_bulk_proxy_check(
     Input:  raw text (one proxy per line, blank lines / # comments allowed)
     Output: clean_proxies.txt (working only) + proxy_check_report.txt (full pass/fail),
             and the first working proxy is activated (after full verification).
+    The progress message carries a 🛑 Stop button; pressing it sets a stop
+    event, short-circuits every queued check, and still produces both files
+    from whatever was already tested.
     """
     chat = update.effective_chat
 
@@ -1326,36 +1389,65 @@ async def run_bulk_proxy_check(
         f"({MAX_CONCURRENT_PROXY_CHECKS} parallel, "
         f"{PROXY_CHECK_CONNECT_TIMEOUT:.0f}s/{PROXY_CHECK_READ_TIMEOUT:.0f}s timeouts)"
     )
-    if status_msg:
-        await status_msg.edit_text(header)
-    else:
-        status_msg = await chat.send_message(header)
 
-    tracker = ProgressTracker(total, status_msg, header)
+    # Register the run so the Stop button has something to flip. A fresh run_id
+    # makes sure a stale button from an earlier run can't cancel this one.
+    run_id = secrets.token_hex(4)
+    stop_event = asyncio.Event()
+    context.chat_data["bulk_proxy_run"] = {"id": run_id, "stop": stop_event}
+    stop_kb = build_stop_keyboard(run_id)
+
+    if status_msg:
+        await status_msg.edit_text(header, reply_markup=stop_kb)
+    else:
+        status_msg = await chat.send_message(header, reply_markup=stop_kb)
+
+    tracker = ProgressTracker(
+        total, status_msg, header,
+        reply_markup=stop_kb, stop_event=stop_event,
+    )
 
     loop = asyncio.get_running_loop()
     sem = asyncio.Semaphore(MAX_CONCURRENT_PROXY_CHECKS)
 
     async def one(raw: str, parsed: tuple) -> dict:
-        result = await check_proxy_candidate(loop, sem, raw, parsed)
-        await tracker.tick(result["ok"])
+        result = await check_proxy_candidate(loop, sem, raw, parsed, stop_event)
+        await tracker.tick(result["ok"], skipped=result.get("skipped", False))
         return result
 
-    results = await asyncio.gather(*(one(raw, p) for raw, p in parsed_list))
-    working = [r for r in results if r["ok"]]
+    try:
+        results = await asyncio.gather(*(one(raw, p) for raw, p in parsed_list))
+    finally:
+        # Whether we finished or got cancelled, clear the run registration so
+        # the stop button (which is about to disappear anyway) has nothing to
+        # flip, and so a new run can start cleanly.
+        context.chat_data.pop("bulk_proxy_run", None)
+
+    was_stopped = stop_event.is_set()
+    passed = [r for r in results if r["ok"]]
+    failed = [r for r in results if not r["ok"] and not r.get("skipped")]
+    skipped = [r for r in results if r.get("skipped")]
 
     # ---- build the two output files -----------------------------------
-    clean_body = "\n".join(r["raw"] for r in working)
+    clean_body = "\n".join(r["raw"] for r in passed)
     if clean_body:
         clean_body += "\n"
 
     report_lines = [
-        f"Proxy check report — {len(working)}/{len(results)} working",
+        f"Proxy check report — {len(passed)}/{len(results)} working",
         f"Source: {source_label}",
-        "",
     ]
+    if was_stopped:
+        report_lines.append("Run was stopped early by the user.")
+    report_lines.append("")
     for r in results:
-        report_lines.append(f"[{'PASS' if r['ok'] else 'FAIL'}] {r['raw']} — {r['note']}")
+        if r.get("skipped"):
+            tag = "SKIP"
+        elif r["ok"]:
+            tag = "PASS"
+        else:
+            tag = "FAIL"
+        report_lines.append(f"[{tag}] {r['raw']} — {r['note']}")
     if unparsed:
         report_lines.append("")
         report_lines.append(f"Couldn't parse ({len(unparsed)} lines, skipped):")
@@ -1368,17 +1460,22 @@ async def run_bulk_proxy_check(
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(report_lines) + "\n")
 
+    # Remove the stop button by deleting the progress message before we post
+    # the result files. (Deleting the message removes its inline keyboard.)
     try:
         await status_msg.delete()
     except Exception:
         pass
 
-    summary = f"{len(working)}/{len(results)} working"
+    summary_parts = [f"{len(passed)}/{len(results)} working"]
+    if was_stopped:
+        summary_parts.append(f"stopped early ({len(skipped)} skipped)")
     if unparsed:
-        summary += f", {len(unparsed)} unparseable line(s) skipped"
+        summary_parts.append(f"{len(unparsed)} unparseable line(s) skipped")
+    summary = ", ".join(summary_parts)
 
     try:
-        if working:
+        if passed:
             with open(clean_path, "rb") as f:
                 await context.bot.send_document(
                     chat_id=chat.id,
@@ -1403,8 +1500,8 @@ async def run_bulk_proxy_check(
             except OSError:
                 pass
 
-    if working:
-        top = working[0]
+    if passed:
+        top = passed[0]
         # The bulk check was a fast reachability screen; before activating,
         # re-verify the winner with the FULL transcript test so we don't set
         # a proxy that reaches YouTube but can't actually fetch captions.
@@ -1445,7 +1542,8 @@ async def checkproxies_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(
             "Easiest way: just upload a .txt file with one proxy per line — "
             "you'll get back clean_proxies.txt containing only the working ones, "
-            "plus a full proxy_check_report.txt.\n\n"
+            "plus a full proxy_check_report.txt. The progress message has a "
+            "🛑 Stop button to cancel mid-run.\n\n"
             "Or paste a short list inline (comma, semicolon, or newline separated):\n"
             "/checkproxies 31.59.20.176:6754:user:pass, 45.12.13.14:8080:u2:p2"
         )
@@ -1560,6 +1658,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     await query.answer()
     data = query.data or ""
+
+    if data.startswith("stopbulk:"):
+        # Set the stop event for the matching run. If the run already finished
+        # (or is a stale button from an earlier run), do nothing — the button
+        # will be gone in a moment anyway, since the progress message is
+        # deleted once the run ends.
+        run_id = data.split(":", 1)[1]
+        run = context.chat_data.get("bulk_proxy_run")
+        if run and run["id"] == run_id and not run["stop"].is_set():
+            run["stop"].set()
+        return
 
     if data == "menu:transcript":
         await _reply_from_callback(query, context, "Send me a YouTube link and I'll fetch the transcript.")
