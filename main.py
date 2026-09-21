@@ -6,6 +6,7 @@ import requests
 import edge_tts
 
 from urllib.parse import urlparse, parse_qs
+from typing import Awaitable, Callable
 
 from telegram import (
     Update,
@@ -38,7 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT-YOUR-TOKEN-HERE")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
 # --- YouTube proxy config (optional, but usually required on a VPS) ----
 # YouTube blocks most cloud/VPS IP ranges from the transcript endpoint.
@@ -53,14 +54,18 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT-YOUR-TOKEN-HERE")
 OWNER_ID_RAW = os.environ.get("OWNER_ID", "").strip()
 OWNER_ID = int(OWNER_ID_RAW) if OWNER_ID_RAW.isdigit() else None
 
-TEST_VIDEO_ID = "dQw4w9WgXcQ"  # long-stable, always-captioned video used to smoke-test a proxy
-
-TEST_VIDEO_ID = "dQw4w9WgXcQ"  # long-stable, always-captioned video used to smoke-test a proxy
+# Long-stable, always-captioned video used to smoke-test a proxy.
+TEST_VIDEO_ID = "dQw4w9WgXcQ"
 
 # Protocols tried, in order, when the input doesn't specify one explicitly.
 PROXY_SCHEMES_TO_TRY = ["http", "socks5", "socks4"]
 
-MAX_CONCURRENT_PROXY_CHECKS = 5  # cap for /checkproxies so a big list doesn't hammer everything at once
+# Cap for the bulk checker so a big list doesn't hammer everything at once.
+MAX_CONCURRENT_PROXY_CHECKS = 5
+
+# Guardrails for the .txt upload path.
+MAX_PROXY_FILE_BYTES = 10 * 1024 * 1024
+ALLOWED_PROXY_FILE_EXTS = (".txt", ".csv", ".list", ".proxies")
 
 # Live, mutable proxy state — starts from env vars, changeable via /setproxy.
 current_proxy = {
@@ -124,7 +129,10 @@ def test_proxy_against_youtube() -> None:
     run via executor. Used by /checkproxy to re-verify what's already set."""
     ytt_api = build_youtube_api()
     transcript_list = ytt_api.list(TEST_VIDEO_ID)
-    transcript = next(iter(transcript_list))
+    try:
+        transcript = next(iter(transcript_list))
+    except StopIteration as exc:
+        raise RuntimeError("Test video returned no transcript tracks.") from exc
     transcript.fetch()
 
 
@@ -137,61 +145,122 @@ def test_proxy_via_urls(http_url: str, https_url: str) -> None:
         proxy_config=GenericProxyConfig(http_url=http_url or None, https_url=https_url or None)
     )
     transcript_list = ytt_api.list(TEST_VIDEO_ID)
-    transcript = next(iter(transcript_list))
+    try:
+        transcript = next(iter(transcript_list))
+    except StopIteration as exc:
+        raise RuntimeError("Test video returned no transcript tracks.") from exc
     transcript.fetch()
 
 
-def build_generic_proxy_urls(host: str, port: str, user: str | None, password: str | None, scheme: str) -> tuple[str, str]:
+def build_generic_proxy_urls(
+    host: str, port: str, user: str | None, password: str | None, scheme: str
+) -> tuple[str, str]:
     auth = f"{user}:{password}@" if user and password else ""
     url = f"{scheme}://{auth}{host}:{port}"
     return url, url
 
 
-def parse_proxy_input(raw: str) -> tuple[str, str, str | None, str | None, str | None] | None:
-    """
-    Auto-detect a wide range of common proxy string shapes. Returns
-    (host, port, username_or_None, password_or_None, forced_scheme_or_None)
-    on success, or None if the string isn't recognizable as a proxy at all.
-    forced_scheme is set only when the input already specified one (a full
-    scheme://... URL) — otherwise every scheme in PROXY_SCHEMES_TO_TRY is
-    worth trying, since a bare host:port:user:pass doesn't say which one it is.
-    """
-    raw = raw.strip().strip("'\"")
+# ----------------------------------------------------------------------
+# Proxy string parsing
+# ----------------------------------------------------------------------
 
-    # A full URL: scheme://[user:pass@]host:port
-    url_match = re.match(
-        r"^(?P<scheme>https?|socks5|socks4)://(?:(?P<user>[^:@\s]+):(?P<pw>[^:@\s]+)@)?"
-        r"(?P<host>[\w.\-]+):(?P<port>\d{2,5})/?$",
-        raw,
-        re.IGNORECASE,
-    )
-    if url_match:
-        d = url_match.groupdict()
-        return d["host"], d["port"], d.get("user"), d.get("pw"), d["scheme"].lower()
+_SCHEME_PREFIX_RE = re.compile(
+    r"^(?P<scheme>https?|socks5h?|socks4a?|socks4)://(?P<rest>.+)$",
+    re.IGNORECASE,
+)
+_USERPASS_AT_RE = re.compile(
+    r"^(?P<user>[^:@\s]+):(?P<pw>[^:@\s]+)@(?P<host>[\w.\-]+):(?P<port>\d{2,5})$"
+)
+_INLINE_SEP_RE = re.compile(r"[,;\t]")
+
+
+def _parse_hostport_pair(raw: str) -> tuple[str, str, str | None, str | None] | None:
+    """(host, port, user|None, pass|None) or None. No scheme handling here."""
+    raw = raw.strip().strip("'\"")
+    m = _USERPASS_AT_RE.match(raw)
+    if m:
+        return m.group("host"), m.group("port"), m.group("user"), m.group("pw")
 
     parts = raw.split(":")
-
+    if len(parts) == 2 and parts[1].isdigit():
+        return parts[0], parts[1], None, None            # host:port
     if len(parts) == 4:
         a, b, c, d = parts
         if b.isdigit():
-            return a, b, c, d, None  # host:port:user:pass
+            return a, b, c, d                            # host:port:user:pass
         if d.isdigit():
-            return c, d, a, b, None  # user:pass:host:port
-        return None
-
-    if len(parts) == 2 and parts[1].isdigit():
-        return parts[0], parts[1], None, None, None  # host:port, no auth
-
-    # user:pass@host:port
-    at_match = re.match(r"^([^:@\s]+):([^:@\s]+)@([\w.\-]+):(\d{2,5})$", raw)
-    if at_match:
-        user, password, host, port = at_match.groups()
-        return host, port, user, password, None
-
+            return c, d, a, b                            # user:pass:host:port
     return None
 
 
-async def auto_configure_proxy(chat, host: str, port: str, user: str | None, password: str | None, forced_scheme: str | None = None):
+def parse_proxy_input(
+    raw: str,
+) -> tuple[str, str, str | None, str | None, str | None] | None:
+    """
+    (host, port, user|None, pass|None, forced_scheme|None) or None.
+    forced_scheme is set only when the input explicitly had one — otherwise
+    every scheme in PROXY_SCHEMES_TO_TRY is worth trying.
+    """
+    raw = raw.strip().strip("'\"")
+    if not raw:
+        return None
+
+    m = _SCHEME_PREFIX_RE.match(raw)
+    if m:
+        inner = _parse_hostport_pair(m.group("rest"))
+        if inner is None:
+            return None
+        host, port, user, pw = inner
+        return host, port, user, pw, m.group("scheme").lower()
+
+    inner = _parse_hostport_pair(raw)
+    if inner is None:
+        return None
+    host, port, user, pw = inner
+    return host, port, user, pw, None
+
+
+def parse_proxy_lines(raw_text: str) -> list[str]:
+    """
+    Turn a pasted / uploaded blob into a clean list of candidate strings.
+
+    Contract:
+      * one proxy per line is the primary format
+      * blank lines, full-line comments (#, //) and trailing # comments are ignored
+      * if a line has commas/semicolons/tabs and doesn't parse as-is, split it
+        (covers CSV exports and "one line, many proxies" pastes)
+      * duplicates are dropped, order preserved
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw_line in raw_text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or line.startswith("//"):
+            continue
+
+        candidates = [line]
+        if parse_proxy_input(line) is None and _INLINE_SEP_RE.search(line):
+            candidates = [tok.strip() for tok in _INLINE_SEP_RE.split(line) if tok.strip()]
+
+        for cand in candidates:
+            if cand and cand not in seen:
+                seen.add(cand)
+                out.append(cand)
+    return out
+
+
+# ----------------------------------------------------------------------
+# Proxy auto-detection (single proxy, from /setproxy)
+# ----------------------------------------------------------------------
+
+async def auto_configure_proxy(
+    chat,
+    host: str,
+    port: str,
+    user: str | None,
+    password: str | None,
+    forced_scheme: str | None = None,
+):
     """
     Try each candidate protocol (or just the one the input specified) against
     a live YouTube fetch, and activate the first one that actually works.
@@ -229,8 +298,6 @@ async def auto_configure_proxy(chat, host: str, port: str, user: str | None, pas
     )
 
 
-
-
 # --- NVIDIA NIM (translation) config -----------------------------------
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
@@ -245,7 +312,7 @@ DEFAULT_NVIDIA_MODEL = "meta/llama-3.1-70b-instruct"
 DEFAULT_EDGE_VOICE = "en-US-AriaNeural"
 
 YOUTUBE_URL_PATTERN = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:youtube\.com|youtu\.be|m\.youtube\.com)/\S+",
+    r"(?:https?://)?(?:www\.)?(?:youtube\.com|youtu\.be|m\.youtube\.com)/[\w\-./?=&%]+",
     re.IGNORECASE,
 )
 
@@ -327,6 +394,22 @@ def build_settings_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+# --- Text chunking for Telegram's 4096-char message cap -----------------
+
+def chunk_lines(lines: list[str], max_chars: int = 3800) -> list[str]:
+    """Split a list of lines into chunks that never cut a line in half."""
+    chunks, current = [], ""
+    for line in lines:
+        if current and len(current) + 1 + len(line) > max_chars:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 # --- YouTube transcript helpers ---------------------------------------
 
 def extract_video_id(url: str) -> str | None:
@@ -374,7 +457,10 @@ def fetch_transcript_text(video_id: str, preferred_langs=("en",)) -> tuple[str, 
 
     if transcript is None:
         # last resort: grab the first transcript available, in any language
-        transcript = next(iter(transcript_list))
+        try:
+            transcript = next(iter(transcript_list))
+        except StopIteration as exc:
+            raise NoTranscriptFound(video_id, preferred_langs, transcript_list) from exc
 
     raw_entries = transcript.fetch()
     language_used = transcript.language
@@ -428,8 +514,11 @@ def clean_transcript(entries) -> str:
     return "\n\n".join(paragraphs)
 
 
-async def fetch_transcript_or_report(chat, status_msg, url: str) -> tuple[str, str] | None:
-    """Shared fetch+error-reporting used by both /transcript and /translate flows."""
+async def fetch_transcript_or_report(
+    chat, status_msg, url: str
+) -> tuple[str, str, str] | None:
+    """Shared fetch+error-reporting used by both /transcript and /translate flows.
+    Returns (video_id, text, language) on success, None on error (already reported)."""
     video_id = extract_video_id(url)
     if not video_id:
         await status_msg.edit_text(
@@ -453,8 +542,8 @@ async def fetch_transcript_or_report(chat, status_msg, url: str) -> tuple[str, s
             "YouTube is blocking this server's IP address — very common when a bot "
             "runs on a VPS/cloud host. This isn't a one-off, it'll keep happening "
             "until a proxy is set.\n\n"
-            "Fix: /setproxy webshare <username> <password> (or /setproxy generic "
-            "<http_url>), then /checkproxy to confirm it actually works."
+            "Fix: upload a .txt with working proxies and I'll test them and set "
+            "the first working one, or /setproxy <proxy> directly."
         )
         return None
     except Exception as exc:  # noqa: BLE001 - surface unexpected errors to the user
@@ -519,11 +608,19 @@ def chunk_text(text: str, max_chars: int = 6000) -> list[str]:
     return chunks or [text]
 
 
-async def translate_text(text: str, target_language: str, model: str) -> str:
-    """Translate arbitrarily long text via NVIDIA NIM, chunk by chunk, in order."""
+async def translate_text(
+    text: str,
+    target_language: str,
+    model: str,
+    progress_cb: Callable[[int, int], Awaitable[None]] | None = None,
+) -> str:
+    """Translate arbitrarily long text via NVIDIA NIM, chunk by chunk, in order.
+    Optionally calls progress_cb(done, total) after each chunk."""
     loop = asyncio.get_running_loop()
+    chunks = chunk_text(text)
+    total = len(chunks)
     translated_chunks = []
-    for chunk in chunk_text(text):
+    for idx, chunk in enumerate(chunks, start=1):
         messages = [
             {
                 "role": "system",
@@ -541,6 +638,11 @@ async def translate_text(text: str, target_language: str, model: str) -> str:
         ]
         result = await loop.run_in_executor(None, call_nvidia_chat, model, messages)
         translated_chunks.append(result)
+        if progress_cb is not None:
+            try:
+                await progress_cb(idx, total)
+            except Exception:
+                pass  # a failed progress ping must never kill the translation
     return "\n\n".join(translated_chunks)
 
 
@@ -564,7 +666,9 @@ async def generate_speech(text: str, voice: str, output_path: str) -> None:
 
 # --- Shared action flows (used by both commands and inline buttons) -------
 
-async def run_transcript_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
+async def run_transcript_fetch(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, url: str
+) -> None:
     chat = update.effective_chat
     await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
     status_msg = await chat.send_message("Fetching transcript…")
@@ -589,19 +693,29 @@ async def run_transcript_fetch(update: Update, context: ContextTypes.DEFAULT_TYP
         f.write("=" * 60 + "\n\n")
         f.write(text)
 
-    await status_msg.delete()
-    with open(file_path, "rb") as f:
-        await context.bot.send_document(
-            chat_id=chat.id,
-            document=f,
-            filename=f"transcript_{video_id}.txt",
-            caption=f"Transcript ready ({language}). What next?",
-            reply_markup=build_post_transcript_keyboard(),
-        )
-    os.remove(file_path)
+    try:
+        await status_msg.delete()
+        with open(file_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=chat.id,
+                document=f,
+                filename=f"transcript_{video_id}.txt",
+                caption=f"Transcript ready ({language}). What next?",
+                reply_markup=build_post_transcript_keyboard(),
+            )
+    finally:
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
 
 
-async def run_translation(update: Update, context: ContextTypes.DEFAULT_TYPE, target_language: str, url: str | None) -> None:
+async def run_translation(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    target_language: str,
+    url: str | None,
+) -> None:
     chat = update.effective_chat
     if not NVIDIA_API_KEY:
         await chat.send_message("NVIDIA_API_KEY is not set on the server.")
@@ -630,8 +744,14 @@ async def run_translation(update: Update, context: ContextTypes.DEFAULT_TYPE, ta
     await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
     await status_msg.edit_text(f"Translating with {model}…")
 
+    async def on_chunk_progress(done: int, total: int) -> None:
+        try:
+            await status_msg.edit_text(f"Translating with {model}… ({done}/{total})")
+        except Exception:
+            pass  # edit raced with something else; not fatal
+
     try:
-        translated = await translate_text(text, target_language, model)
+        translated = await translate_text(text, target_language, model, on_chunk_progress)
     except Exception as exc:
         logger.exception("Translation failed")
         await status_msg.edit_text(f"Translation failed: {exc}")
@@ -645,19 +765,26 @@ async def run_translation(update: Update, context: ContextTypes.DEFAULT_TYPE, ta
         f.write("=" * 60 + "\n\n")
         f.write(translated)
 
-    await status_msg.delete()
-    with open(file_path, "rb") as f:
-        await context.bot.send_document(
-            chat_id=chat.id,
-            document=f,
-            filename=os.path.basename(file_path),
-            caption=f"Translated to {target_language} (model: {model}).",
-            reply_markup=build_post_translate_keyboard(),
-        )
-    os.remove(file_path)
+    try:
+        await status_msg.delete()
+        with open(file_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=chat.id,
+                document=f,
+                filename=os.path.basename(file_path),
+                caption=f"Translated to {target_language} (model: {model}).",
+                reply_markup=build_post_translate_keyboard(),
+            )
+    finally:
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
 
 
-async def run_voice_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, source: str | None) -> None:
+async def run_voice_generation(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, source: str | None
+) -> None:
     chat = update.effective_chat
 
     if source == "original":
@@ -687,18 +814,27 @@ async def run_voice_generation(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as exc:
         logger.exception("TTS generation failed")
         await status_msg.edit_text(f"Speech generation failed: {exc}")
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
         return
 
-    await status_msg.delete()
-    with open(file_path, "rb") as f:
-        await context.bot.send_audio(
-            chat_id=chat.id,
-            audio=f,
-            title=f"{video_id} narration",
-            performer=voice,
-            caption=f"Voice: {voice}",
-        )
-    os.remove(file_path)
+    try:
+        await status_msg.delete()
+        with open(file_path, "rb") as f:
+            await context.bot.send_audio(
+                chat_id=chat.id,
+                audio=f,
+                title=f"{video_id} narration",
+                performer=voice,
+                caption=f"Voice: {voice}",
+            )
+    finally:
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
 
 
 async def send_all_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -718,12 +854,14 @@ async def send_all_models(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await chat.send_message("NVIDIA returned no models for this key.")
         return
 
-    body = "Models available to your key (pick any with /model <id>):\n\n" + "\n".join(models)
-    for i in range(0, len(body), 3800):  # stay under Telegram's 4096-char message cap
-        await chat.send_message(body[i : i + 3800])
+    header = "Models available to your key (pick any with /model <id>):"
+    for chunk in chunk_lines([header, ""] + models):
+        await chat.send_message(chunk)
 
 
-async def send_all_voices(update: Update, context: ContextTypes.DEFAULT_TYPE, filter_str: str | None) -> None:
+async def send_all_voices(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, filter_str: str | None
+) -> None:
     chat = update.effective_chat
     try:
         names = await list_edge_voices(filter_str)
@@ -736,13 +874,12 @@ async def send_all_voices(update: Update, context: ContextTypes.DEFAULT_TYPE, fi
         return
 
     header = (
-        f"Voices matching '{filter_str}' (pick one with /setvoice <id>):\n\n"
+        f"Voices matching '{filter_str}' (pick one with /setvoice <id>):"
         if filter_str
-        else "All edge-tts voices — filter it, e.g. /voices en-US or /voices Hindi:\n\n"
+        else "All edge-tts voices — filter it, e.g. /voices en-US or /voices Hindi:"
     )
-    body = header + "\n".join(names)
-    for i in range(0, len(body), 3800):
-        await chat.send_message(body[i : i + 3800])
+    for chunk in chunk_lines([header, ""] + names):
+        await chat.send_message(chunk)
 
 
 async def send_settings_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -764,17 +901,20 @@ HELP_TEXT = (
     "/models — list every model your NVIDIA API key can use\n"
     "/model <model_id> — pick which one to translate with\n\n"
     "Voice (Edge TTS, free):\n"
-    "/voice — narrate the last transcript/translation as .mp3\n"
+    "/voice [original|translated] — narrate the last transcript/translation as .mp3\n"
     "/voices <filter> — browse voices, e.g. /voices en-US\n"
     "/setvoice <voice_id> — pick which voice to narrate with\n\n"
     "/settings — see and change your current model & voice\n\n"
     "Proxy (only needed if YouTube blocks this server's IP):\n"
+    "The reliable way: just upload a .txt file with one proxy per line. "
+    "I'll test them all, activate the first working one, and send back:\n"
+    "  • clean_proxies.txt — only the working ones\n"
+    "  • proxy_check_report.txt — full pass/fail with reasons\n\n"
+    "/setproxy <anything> — auto-detect a single proxy and set it\n"
+    "/checkproxies <list> — test a short inline list\n"
     "/proxystatus — show the current proxy\n"
-    "/setproxy <anything> — paste a proxy in almost any format, I'll "
-    "auto-detect it, try protocols, and verify it live\n"
-    "/checkproxies <list> — test a whole list at once, one per line\n"
-    "/clearproxy — go back to a direct connection\n"
-    "/checkproxy — re-verify the current proxy"
+    "/checkproxy — re-verify the current proxy\n"
+    "/clearproxy — go back to a direct connection"
 )
 
 
@@ -862,6 +1002,13 @@ async def setvoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     source = context.args[0].lower().strip() if context.args else None
+    if source is not None and source not in ("original", "translated"):
+        await update.message.reply_text(
+            "Usage: /voice — narrate the latest text\n"
+            "/voice original — force the original transcript\n"
+            "/voice translated — force the translated version"
+        )
+        return
     await run_voice_generation(update, context, source)
 
 
@@ -886,9 +1033,8 @@ async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "Or be explicit:\n"
             "/setproxy webshare <username> <password>\n"
             "/setproxy generic <http_url> [https_url]\n\n"
-            "/clearproxy — go back to a direct connection\n"
-            "/checkproxy — re-verify the current proxy\n"
-            "/checkproxies <list> — test many proxies at once (one per line)\n\n"
+            "For a LIST of proxies, just upload a .txt with one per line — that's "
+            "the reliable path, and you'll get back a clean file.\n\n"
             f"Current: {describe_current_proxy()}"
         )
         return
@@ -957,26 +1103,76 @@ async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await auto_configure_proxy(chat, host, port, user, password, forced_scheme)
 
 
-async def checkproxies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_owner(update):
-        await update.message.reply_text("Only the bot owner can run this.")
-        return
+# ----------------------------------------------------------------------
+# Bulk proxy check — the reliable file-in / file-out path
+# ----------------------------------------------------------------------
 
-    raw_candidates = context.args
+async def check_proxy_candidate(
+    loop, semaphore: asyncio.Semaphore, raw: str, parsed
+) -> dict:
+    """
+    Test one proxy candidate reliably: try every viable protocol (or just the
+    one an explicit scheme:// URL specified), with one retry per protocol to
+    smooth over transient network blips. A definitive YouTube block is NOT
+    retried (retrying won't change a hard block) — everything else gets a
+    second attempt before being marked failed.
+    """
+    host, port, user, password, forced_scheme = parsed
+    schemes = [forced_scheme] if forced_scheme else PROXY_SCHEMES_TO_TRY
+    attempts = []
+    async with semaphore:
+        for scheme in schemes:
+            http_url, https_url = build_generic_proxy_urls(host, port, user, password, scheme)
+            for attempt_num in (1, 2):
+                try:
+                    await loop.run_in_executor(None, test_proxy_via_urls, http_url, https_url)
+                    return {
+                        "raw": raw, "ok": True, "scheme": scheme,
+                        "http_url": http_url, "https_url": https_url,
+                        "note": f"working via {scheme}://",
+                    }
+                except (RequestBlocked, IpBlocked):
+                    attempts.append(f"{scheme}:// → blocked by YouTube")
+                    break  # deterministic block — retrying this scheme won't help
+                except Exception as exc:  # noqa: BLE001
+                    if attempt_num == 1:
+                        await asyncio.sleep(1.5)  # brief pause, then one retry
+                        continue
+                    attempts.append(f"{scheme}:// → {type(exc).__name__}: {exc}")
+    return {
+        "raw": raw, "ok": False, "scheme": None,
+        "http_url": None, "https_url": None,
+        "note": "; ".join(attempts) or "no working protocol",
+    }
+
+
+async def run_bulk_proxy_check(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    raw_text: str,
+    status_msg=None,
+    source_label: str = "your list",
+) -> None:
+    """
+    The one engine behind /checkproxies and .txt-file uploads.
+
+    Input:  raw text (one proxy per line, blank lines / # comments allowed)
+    Output: clean_proxies.txt (working only) + proxy_check_report.txt (full pass/fail),
+            and the first working proxy is activated.
+    """
+    chat = update.effective_chat
+
+    raw_candidates = parse_proxy_lines(raw_text)
     if not raw_candidates:
-        await update.message.reply_text(
-            "Paste a list of proxies after the command, one per line (or "
-            "space-separated) — any mix of the formats /setproxy accepts. "
-            "The first one that works gets activated automatically. Example:\n\n"
-            "/checkproxies\n"
-            "31.59.20.176:6754:hmpbjiqx:wrn4o46h9o68\n"
-            "45.12.13.14:8080:user2:pass2\n"
-            "user3:pass3@66.7.8.9:3128"
-        )
+        msg = "No proxy-looking lines found in that input."
+        if status_msg:
+            await status_msg.edit_text(msg)
+        else:
+            await chat.send_message(msg)
         return
 
-    parsed_list = []
-    unparsed = []
+    parsed_list: list[tuple[str, tuple]] = []
+    unparsed: list[str] = []
     for raw in raw_candidates:
         parsed = parse_proxy_input(raw)
         if parsed is None:
@@ -985,63 +1181,196 @@ async def checkproxies_command(update: Update, context: ContextTypes.DEFAULT_TYP
             parsed_list.append((raw, parsed))
 
     if not parsed_list:
-        await update.message.reply_text("None of those looked like a proxy I could parse.")
+        sample = "\n".join(unparsed[:5])
+        msg = (
+            f"None of the {len(raw_candidates)} lines looked like a proxy I could parse.\n"
+            f"First few:\n{sample}"
+        )
+        if status_msg:
+            await status_msg.edit_text(msg)
+        else:
+            await chat.send_message(msg)
         return
 
-    status_msg = await update.message.reply_text(
-        f"Testing {len(parsed_list)} prox{'y' if len(parsed_list) == 1 else 'ies'} "
-        f"against YouTube (only the default protocol per entry — this can take a bit)…"
+    total = len(parsed_list)
+    header = (
+        f"Testing {total} prox{'y' if total == 1 else 'ies'} from {source_label} — "
+        f"up to {MAX_CONCURRENT_PROXY_CHECKS} at a time, multi-protocol with one retry "
+        f"on transient errors."
     )
+    if status_msg:
+        await status_msg.edit_text(header)
+    else:
+        status_msg = await chat.send_message(header)
 
     loop = asyncio.get_running_loop()
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_PROXY_CHECKS)
+    sem = asyncio.Semaphore(MAX_CONCURRENT_PROXY_CHECKS)
+    counter = {"done": 0}
+    counter_lock = asyncio.Lock()
 
-    async def check_one(raw: str, parsed):
-        host, port, user, password, forced_scheme = parsed
-        scheme = forced_scheme or "http"
-        http_url, https_url = build_generic_proxy_urls(host, port, user, password, scheme)
-        async with semaphore:
+    async def tick() -> None:
+        async with counter_lock:
+            counter["done"] += 1
+            done = counter["done"]
+        if done % 5 == 0 or done == total:
             try:
-                await loop.run_in_executor(None, test_proxy_via_urls, http_url, https_url)
-                return raw, scheme, http_url, https_url, True, None
-            except Exception as exc:  # noqa: BLE001
-                return raw, scheme, http_url, https_url, False, f"{type(exc).__name__}: {exc}"
+                await status_msg.edit_text(f"Testing proxies… {done}/{total}")
+            except Exception:
+                pass  # message edited/deleted elsewhere — not fatal
 
-    results = await asyncio.gather(*(check_one(raw, parsed) for raw, parsed in parsed_list))
-    working = [r for r in results if r[4]]
+    async def one(raw: str, parsed: tuple) -> dict:
+        try:
+            return await check_proxy_candidate(loop, sem, raw, parsed)
+        finally:
+            await tick()
 
-    lines = [f"Tested {len(results)} prox{'y' if len(results) == 1 else 'ies'}:\n"]
-    for raw, scheme, _http_url, _https_url, ok, err in results:
-        lines.append(f"{'✅' if ok else '❌'} {raw}" + ("" if ok else f" — {err}"))
+    results = await asyncio.gather(*(one(raw, p) for raw, p in parsed_list))
+    working = [r for r in results if r["ok"]]
+
+    # ---- build the two output files -----------------------------------
+    clean_body = "\n".join(r["raw"] for r in working)
+    if clean_body:
+        clean_body += "\n"
+
+    report_lines = [
+        f"Proxy check report — {len(working)}/{len(results)} working",
+        f"Source: {source_label}",
+        "",
+    ]
+    for r in results:
+        report_lines.append(f"[{'PASS' if r['ok'] else 'FAIL'}] {r['raw']} — {r['note']}")
     if unparsed:
-        lines.append("\nCouldn't parse:\n" + "\n".join(unparsed))
+        report_lines.append("")
+        report_lines.append(f"Couldn't parse ({len(unparsed)} lines, skipped):")
+        report_lines.extend(unparsed)
 
-    report = "\n".join(lines)
-    first_chunk, *rest_chunks = [report[i : i + 3800] for i in range(0, len(report), 3800)] or [""]
-    await status_msg.edit_text(first_chunk)
-    for chunk in rest_chunks:
-        await update.message.reply_text(chunk)
+    clean_path = "/tmp/clean_proxies.txt"
+    report_path = "/tmp/proxy_check_report.txt"
+    with open(clean_path, "w", encoding="utf-8") as f:
+        f.write(clean_body)
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(report_lines) + "\n")
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+    summary = f"{len(working)}/{len(results)} working"
+    if unparsed:
+        summary += f", {len(unparsed)} unparseable line(s) skipped"
+
+    try:
+        if working:
+            with open(clean_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=chat.id,
+                    document=f,
+                    filename="clean_proxies.txt",
+                    caption=f"✅ {summary}",
+                )
+        else:
+            await chat.send_message(f"❌ {summary} — no working proxies, nothing clean to send.")
+
+        with open(report_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=chat.id,
+                document=f,
+                filename="proxy_check_report.txt",
+                caption="Full pass/fail report.",
+            )
+    finally:
+        for p in (clean_path, report_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
     if working:
-        raw, scheme, http_url, https_url, _, _ = working[0]
+        top = working[0]
         current_proxy.update(
-            type="generic", http_url=http_url, https_url=https_url,
-            webshare_username="", webshare_password="",
+            type="generic",
+            http_url=top["http_url"],
+            https_url=top["https_url"],
+            webshare_username="",
+            webshare_password="",
         )
+        await chat.send_message(
+            f"🏆 Activated the first working proxy: {top['raw']} (via {top['scheme']}://)\n"
+            "Run /proxystatus to confirm."
+        )
+
+
+async def checkproxies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update):
+        await update.message.reply_text("Only the bot owner can run this.")
+        return
+
+    if not context.args:
         await update.message.reply_text(
-            f"🏆 Activated the first working one: {raw} (via {scheme}://)\n"
-            "Run /proxystatus to confirm, or /setproxy a different entry from the "
-            "list above if you'd rather use another."
+            "Easiest way: just upload a .txt file with one proxy per line — "
+            "you'll get back clean_proxies.txt containing only the working ones, "
+            "plus a full proxy_check_report.txt.\n\n"
+            "Or paste a short list inline (comma, semicolon, or newline separated):\n"
+            "/checkproxies 31.59.20.176:6754:user:pass, 45.12.13.14:8080:u2:p2"
         )
-    else:
-        await update.message.reply_text("None of them worked against YouTube.")
+        return
+
+    # context.args already split on whitespace; join back so the line-parser
+    # can also handle comma/semicolon splits.
+    raw_text = " ".join(context.args)
+    await run_bulk_proxy_check(update, context, raw_text, source_label="your message")
+
+
+async def proxy_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Primary interface for bulk proxy checking: upload a .txt (one proxy per
+    line) and get back clean_proxies.txt + proxy_check_report.txt.
+    """
+    if not is_owner(update):
+        await update.message.reply_text("Only the bot owner can check proxy lists.")
+        return
+
+    document = update.message.document
+    filename = document.file_name or "upload"
+    lower = filename.lower()
+
+    if not lower.endswith(ALLOWED_PROXY_FILE_EXTS):
+        await update.message.reply_text(
+            "Send your proxy list as a .txt file (also accepted: .csv, .list, .proxies), "
+            "one proxy per line."
+        )
+        return
+
+    if document.file_size and document.file_size > MAX_PROXY_FILE_BYTES:
+        await update.message.reply_text("That file's too large — keep proxy lists under 10 MB.")
+        return
+
+    status_msg = await update.message.reply_text(f"Reading {filename}…")
+    try:
+        tg_file = await context.bot.get_file(document.file_id)
+        raw_bytes = await tg_file.download_as_bytearray()
+    except Exception as exc:
+        await status_msg.edit_text(f"Couldn't download that file: {exc}")
+        return
+
+    text = bytes(raw_bytes).decode("utf-8", errors="ignore")
+    if not text.strip():
+        await status_msg.edit_text("That file looked empty.")
+        return
+
+    await run_bulk_proxy_check(
+        update, context, text, status_msg=status_msg, source_label=filename
+    )
 
 
 async def clearproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
         await update.message.reply_text("Only the bot owner can change the proxy.")
         return
-    current_proxy.update(type=None, webshare_username="", webshare_password="", http_url="", https_url="")
+    current_proxy.update(
+        type=None, webshare_username="", webshare_password="", http_url="", https_url=""
+    )
     await update.message.reply_text("Proxy cleared — requests will connect to YouTube directly.")
 
 
@@ -1073,7 +1402,23 @@ async def checkproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await status_msg.edit_text(f"❌ Test failed via {proxy_desc}:\n{exc}")
         return
 
-    await status_msg.edit_text(f"✅ Working — successfully fetched a test transcript via: {proxy_desc}")
+    await status_msg.edit_text(
+        f"✅ Working — successfully fetched a test transcript via: {proxy_desc}"
+    )
+
+
+# --- Callback router ---------------------------------------------------
+
+async def _reply_from_callback(query, context: ContextTypes.DEFAULT_TYPE, text: str,
+                               reply_markup: InlineKeyboardMarkup | None = None) -> None:
+    """Reply to a callback safely: prefer the original message, fall back to a
+    direct message to the user if the original message is unreachable."""
+    if query.message is not None:
+        await query.message.reply_text(text, reply_markup=reply_markup)
+    elif query.from_user is not None:
+        await context.bot.send_message(
+            chat_id=query.from_user.id, text=text, reply_markup=reply_markup
+        )
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1082,16 +1427,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = query.data or ""
 
     if data == "menu:transcript":
-        await query.message.reply_text("Send me a YouTube link and I'll fetch the transcript.")
+        await _reply_from_callback(query, context, "Send me a YouTube link and I'll fetch the transcript.")
 
     elif data == "menu:translate":
         if not NVIDIA_API_KEY:
-            await query.message.reply_text("NVIDIA_API_KEY is not set on the server.")
+            await _reply_from_callback(query, context, "NVIDIA_API_KEY is not set on the server.")
             return
         if not context.chat_data.get("last_transcript"):
-            await query.message.reply_text("No transcript on file yet — send a YouTube link first.")
+            await _reply_from_callback(
+                query, context, "No transcript on file yet — send a YouTube link first."
+            )
             return
-        await query.message.reply_text("Pick a language:", reply_markup=build_language_keyboard())
+        await _reply_from_callback(
+            query, context, "Pick a language:", reply_markup=build_language_keyboard()
+        )
 
     elif data == "menu:voice":
         await run_voice_generation(update, context, source=None)
@@ -1100,13 +1449,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await send_settings_message(update, context)
 
     elif data == "changemodel":
-        await query.message.reply_text(
+        await _reply_from_callback(
+            query, context,
             "Pick a shortcut, or use /model <model_id> for any other:",
             reply_markup=build_model_keyboard(),
         )
 
     elif data == "changevoice":
-        await query.message.reply_text(
+        await _reply_from_callback(
+            query, context,
             "Pick a shortcut, or use /setvoice <voice_id> for any other:",
             reply_markup=build_voice_keyboard(),
         )
@@ -1120,17 +1471,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data.startswith("setmodel:"):
         model_id = data.split(":", 1)[1]
         context.chat_data["nvidia_model"] = model_id
-        await query.message.reply_text(f"Translation model set to: {model_id}")
+        await _reply_from_callback(query, context, f"Translation model set to: {model_id}")
 
     elif data.startswith("setvoice:"):
         voice_id = data.split(":", 1)[1]
         context.chat_data["edge_voice"] = voice_id
-        await query.message.reply_text(f"Voice set to: {voice_id}")
+        await _reply_from_callback(query, context, f"Voice set to: {voice_id}")
 
     elif data.startswith("lang:"):
         lang = data.split(":", 1)[1]
         if lang == "custom":
-            await query.message.reply_text("Type it as: /translate <language>\nExample: /translate Bengali")
+            await _reply_from_callback(
+                query, context,
+                "Type it as: /translate <language>\nExample: /translate Bengali",
+            )
             return
         await run_translation(update, context, target_language=lang, url=None)
 
@@ -1146,12 +1500,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await run_transcript_fetch(update, context, match.group(0))
     else:
         await update.message.reply_text(
-            "Send a YouTube link and I'll pull the transcript for you, or /help for everything I can do."
+            "Send a YouTube link and I'll pull the transcript for you, or /help "
+            "for everything I can do."
         )
 
 
 async def post_init(application: Application) -> None:
-    """Registers the native Telegram '/' command menu."""
+    """Registers the native Telegram '/' command menu and logs startup warnings."""
     await application.bot.set_my_commands([
         BotCommand("start", "Welcome menu with buttons"),
         BotCommand("help", "List everything the bot can do"),
@@ -1170,9 +1525,18 @@ async def post_init(application: Application) -> None:
         BotCommand("checkproxies", "Test a whole list of proxies at once (owner only)"),
     ])
 
+    if OWNER_ID is None:
+        logger.warning(
+            "OWNER_ID is not set — /setproxy, /clearproxy and /checkproxies are open "
+            "to ANY user of this bot. Set OWNER_ID to your numeric Telegram user ID "
+            "to lock them down."
+        )
+    if not NVIDIA_API_KEY:
+        logger.info("NVIDIA_API_KEY not set — /translate and /models are disabled.")
+
 
 def main() -> None:
-    if BOT_TOKEN == "PUT-YOUR-TOKEN-HERE":
+    if not BOT_TOKEN or BOT_TOKEN == "PUT-YOUR-TOKEN-HERE":
         raise SystemExit(
             "Set the BOT_TOKEN environment variable to your Telegram bot token first."
         )
@@ -1195,6 +1559,7 @@ def main() -> None:
     app.add_handler(CommandHandler("checkproxy", checkproxy_command))
     app.add_handler(CommandHandler("checkproxies", checkproxies_command))
     app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.Document.ALL, proxy_file_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
     logger.info("Bot starting…")
