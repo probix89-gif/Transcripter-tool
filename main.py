@@ -60,8 +60,17 @@ TEST_VIDEO_ID = "dQw4w9WgXcQ"
 # Protocols tried, in order, when the input doesn't specify one explicitly.
 PROXY_SCHEMES_TO_TRY = ["http", "socks5", "socks4"]
 
-# Cap for the bulk checker so a big list doesn't hammer everything at once.
-MAX_CONCURRENT_PROXY_CHECKS = 5
+# Bulk-checker concurrency. The proxies themselves become the bottleneck past
+# ~100 concurrent sockets, so don't push much higher than this unless you know
+# your provider tolerates it. Tunable via env without editing code.
+MAX_CONCURRENT_PROXY_CHECKS = int(os.environ.get("PROXY_CHECK_CONCURRENCY", "50"))
+
+# Delay before the single retry per scheme on transient (non-block) errors.
+PROXY_CHECK_RETRY_DELAY = float(os.environ.get("PROXY_CHECK_RETRY_DELAY", "0.5"))
+
+# Minimum seconds between Telegram progress-message edits. Telegram rate-limits
+# edits to roughly 1/sec per chat; 1.5s is safe and still feels live.
+PROGRESS_EDIT_INTERVAL = float(os.environ.get("PROGRESS_EDIT_INTERVAL", "1.5"))
 
 # Guardrails for the .txt upload path.
 MAX_PROXY_FILE_BYTES = 10 * 1024 * 1024
@@ -408,6 +417,76 @@ def chunk_lines(lines: list[str], max_chars: int = 3800) -> list[str]:
     if current:
         chunks.append(current)
     return chunks
+
+
+# --- Progress bar for the bulk proxy check ------------------------------
+
+def format_duration(seconds: float) -> str:
+    s = int(max(0, seconds))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+class ProgressTracker:
+    """Live progress bar for the bulk proxy check.
+
+    Edits the status message at most once every PROGRESS_EDIT_INTERVAL seconds
+    so a large run doesn't trip Telegram's edit rate limit but still looks
+    live. The final tick always forces an edit so the bar lands on 100%.
+    """
+
+    def __init__(self, total: int, status_msg, header: str):
+        self.total = total
+        self.status_msg = status_msg
+        self.header = header
+        self.done = 0
+        self.passed = 0
+        self.failed = 0
+        self.started = asyncio.get_running_loop().time()
+        self._lock = asyncio.Lock()
+        self._last_edit = 0.0
+
+    async def tick(self, ok: bool) -> None:
+        async with self._lock:
+            self.done += 1
+            if ok:
+                self.passed += 1
+            else:
+                self.failed += 1
+            now = asyncio.get_running_loop().time()
+            is_last = self.done >= self.total
+            if not is_last and (now - self._last_edit) < PROGRESS_EDIT_INTERVAL:
+                return
+            self._last_edit = now
+
+        try:
+            await self.status_msg.edit_text(self._render())
+        except Exception:
+            pass  # message edited/deleted elsewhere — never fatal
+
+    def _render(self) -> str:
+        width = 18
+        ratio = self.done / self.total if self.total else 0.0
+        filled = int(width * ratio)
+        bar = "█" * filled + "░" * (width - filled)
+        pct = ratio * 100
+
+        elapsed = asyncio.get_running_loop().time() - self.started
+        rate = self.done / elapsed if elapsed > 0 and self.done > 0 else 0.0
+        remaining = self.total - self.done
+        eta = remaining / rate if rate > 0 else 0.0
+
+        return (
+            f"{self.header}\n\n"
+            f"`[{bar}]` {pct:5.1f}%\n"
+            f"✅ {self.passed} working   ❌ {self.failed} failed\n"
+            f"⚡ {rate:0.1f}/s   ⏳ ETA {format_duration(eta)}"
+        )
 
 
 # --- YouTube transcript helpers ---------------------------------------
@@ -907,7 +986,8 @@ HELP_TEXT = (
     "/settings — see and change your current model & voice\n\n"
     "Proxy (only needed if YouTube blocks this server's IP):\n"
     "The reliable way: just upload a .txt file with one proxy per line. "
-    "I'll test them all, activate the first working one, and send back:\n"
+    "I'll test them all (with a live progress bar), activate the first "
+    "working one, and send back:\n"
     "  • clean_proxies.txt — only the working ones\n"
     "  • proxy_check_report.txt — full pass/fail with reasons\n\n"
     "/setproxy <anything> — auto-detect a single proxy and set it\n"
@@ -1136,7 +1216,7 @@ async def check_proxy_candidate(
                     break  # deterministic block — retrying this scheme won't help
                 except Exception as exc:  # noqa: BLE001
                     if attempt_num == 1:
-                        await asyncio.sleep(1.5)  # brief pause, then one retry
+                        await asyncio.sleep(PROXY_CHECK_RETRY_DELAY)
                         continue
                     attempts.append(f"{scheme}:// → {type(exc).__name__}: {exc}")
     return {
@@ -1194,35 +1274,23 @@ async def run_bulk_proxy_check(
 
     total = len(parsed_list)
     header = (
-        f"Testing {total} prox{'y' if total == 1 else 'ies'} from {source_label} — "
-        f"up to {MAX_CONCURRENT_PROXY_CHECKS} at a time, multi-protocol with one retry "
-        f"on transient errors."
+        f"Testing {total} prox{'y' if total == 1 else 'ies'} from {source_label} "
+        f"({MAX_CONCURRENT_PROXY_CHECKS} parallel)"
     )
     if status_msg:
         await status_msg.edit_text(header)
     else:
         status_msg = await chat.send_message(header)
 
+    tracker = ProgressTracker(total, status_msg, header)
+
     loop = asyncio.get_running_loop()
     sem = asyncio.Semaphore(MAX_CONCURRENT_PROXY_CHECKS)
-    counter = {"done": 0}
-    counter_lock = asyncio.Lock()
-
-    async def tick() -> None:
-        async with counter_lock:
-            counter["done"] += 1
-            done = counter["done"]
-        if done % 5 == 0 or done == total:
-            try:
-                await status_msg.edit_text(f"Testing proxies… {done}/{total}")
-            except Exception:
-                pass  # message edited/deleted elsewhere — not fatal
 
     async def one(raw: str, parsed: tuple) -> dict:
-        try:
-            return await check_proxy_candidate(loop, sem, raw, parsed)
-        finally:
-            await tick()
+        result = await check_proxy_candidate(loop, sem, raw, parsed)
+        await tracker.tick(result["ok"])
+        return result
 
     results = await asyncio.gather(*(one(raw, p) for raw, p in parsed_list))
     working = [r for r in results if r["ok"]]
@@ -1533,6 +1601,10 @@ async def post_init(application: Application) -> None:
         )
     if not NVIDIA_API_KEY:
         logger.info("NVIDIA_API_KEY not set — /translate and /models are disabled.")
+    logger.info(
+        "Bulk proxy checker: concurrency=%d, retry_delay=%.1fs, progress_edit=%.1fs",
+        MAX_CONCURRENT_PROXY_CHECKS, PROXY_CHECK_RETRY_DELAY, PROGRESS_EDIT_INTERVAL,
+    )
 
 
 def main() -> None:
