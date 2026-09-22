@@ -35,1830 +35,4843 @@ from youtube_transcript_api._errors import (
     IpBlocked,
 )
 
+
+# ==========================================================================
+# LOGGING
+# ==========================================================================
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
 logger = logging.getLogger(__name__)
+
+
+# ==========================================================================
+# ENVIRONMENT
+# ==========================================================================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
-# --- YouTube proxy config (optional, but usually required on a VPS) ----
-# YouTube blocks most cloud/VPS IP ranges from the transcript endpoint.
-# Configurable two ways:
-#   1. Env vars at startup (WEBSHARE_PROXY_USERNAME/PASSWORD or
-#      PROXY_HTTP_URL/PROXY_HTTPS_URL) — persists across restarts.
-#   2. /setproxy in Telegram — changes it live, no restart needed, but
-#      resets to the env-var default if the bot restarts.
-# OWNER_ID locks /setproxy, /clearproxy, /checkproxy, /checkproxies and
-# /stop to one Telegram user ID — this is server-wide config, not a
-# per-chat preference, so without a lock ANY user of the bot could
-# hijack or disable it.
-OWNER_ID_RAW = os.environ.get("OWNER_ID", "").strip()
-OWNER_ID = int(OWNER_ID_RAW) if OWNER_ID_RAW.isdigit() else None
+NVIDIA_API_KEY = os.environ.get(
+    "NVIDIA_API_KEY",
+    "",
+).strip()
 
-# Long-stable, always-captioned video used to smoke-test a proxy.
-TEST_VIDEO_ID = "dQw4w9WgXcQ"
+OWNER_ID_RAW = os.environ.get(
+    "OWNER_ID",
+    "",
+).strip()
 
-# Protocols tried, in order, when the input doesn't specify one explicitly.
-PROXY_SCHEMES_TO_TRY = ["http", "socks5", "socks4"]
-
-# ---- Bulk-checker tuning (all env-tunable) ----------------------------
-# Concurrency: how many proxies are checked in parallel. Above ~100 your
-# proxy provider usually becomes the bottleneck, not the bot.
-MAX_CONCURRENT_PROXY_CHECKS = int(os.environ.get("PROXY_CHECK_CONCURRENCY", "50"))
-
-# Timeouts for the LIGHTWEIGHT bulk check (a single HTTP request per proxy).
-# Dead proxies used to hang for 60s on the transcript API's default timeout;
-# 5s connect / 10s read makes them fail fast and multiplies throughput.
-PROXY_CHECK_CONNECT_TIMEOUT = float(os.environ.get("PROXY_CHECK_CONNECT_TIMEOUT", "5"))
-PROXY_CHECK_READ_TIMEOUT = float(os.environ.get("PROXY_CHECK_READ_TIMEOUT", "10"))
-
-# Delay before the single retry per scheme on transient (non-block) errors.
-PROXY_CHECK_RETRY_DELAY = float(os.environ.get("PROXY_CHECK_RETRY_DELAY", "0.5"))
-
-# Size of the thread pool used to run blocking checks. Must be >= concurrency,
-# otherwise tasks queue behind idle threads and your "50 parallel" runs at 32.
-# Default = 2x concurrency, floored at 64, so there's headroom for retries too.
-PROXY_CHECK_EXECUTOR_WORKERS = int(
-    os.environ.get("PROXY_CHECK_EXECUTOR_WORKERS", str(max(64, MAX_CONCURRENT_PROXY_CHECKS * 2)))
+OWNER_ID = (
+    int(OWNER_ID_RAW)
+    if OWNER_ID_RAW.isdigit()
+    else None
 )
 
-# Minimum seconds between Telegram progress-message edits. Telegram rate-limits
-# edits to roughly 1/sec per chat; 1.5s is safe and still feels live.
-PROGRESS_EDIT_INTERVAL = float(os.environ.get("PROGRESS_EDIT_INTERVAL", "1.5"))
 
-# Guardrails for the .txt upload path.
-MAX_PROXY_FILE_BYTES = 10 * 1024 * 1024
-ALLOWED_PROXY_FILE_EXTS = (".txt", ".csv", ".list", ".proxies")
+# ==========================================================================
+# NVIDIA TRANSLATION CONFIG
+# ==========================================================================
 
-# Live, mutable proxy state — starts from env vars, changeable via /setproxy.
+NVIDIA_CHAT_URL = (
+    "https://integrate.api.nvidia.com/v1/chat/completions"
+)
+
+NVIDIA_MODELS_URL = (
+    "https://integrate.api.nvidia.com/v1/models"
+)
+
+# Current NVIDIA NIM model ID.
+DEFAULT_NVIDIA_MODEL = (
+    "nvidia/nemotron-3-ultra-550b-a55b"
+)
+
+# --------------------------------------------------------------------------
+# IMPORTANT:
+# User requested a 30 RPM limit.
+#
+# 60 / 30 = 2 seconds exactly.
+#
+# We intentionally use 2.2 seconds between request starts so the bot
+# stays below the limit instead of sitting exactly on the boundary.
+# --------------------------------------------------------------------------
+
+NVIDIA_RPM_LIMIT = 30
+
+NVIDIA_MIN_REQUEST_INTERVAL = (
+    60.0 / NVIDIA_RPM_LIMIT
+) + 0.2
+
+# Translation chunk size.
+#
+# We deliberately don't use the model's huge context window for one giant
+# translation request. Smaller chunks give much more reliable output.
+TRANSLATION_MAX_CHARS = int(
+    os.environ.get(
+        "TRANSLATION_MAX_CHARS",
+        "5000",
+    )
+)
+
+# Maximum generated tokens for one translation chunk.
+TRANSLATION_MAX_TOKENS = int(
+    os.environ.get(
+        "TRANSLATION_MAX_TOKENS",
+        "8192",
+    )
+)
+
+# Maximum retry attempts for temporary NVIDIA errors.
+NVIDIA_MAX_RETRIES = int(
+    os.environ.get(
+        "NVIDIA_MAX_RETRIES",
+        "4",
+    )
+)
+
+
+# ==========================================================================
+# EDGE TTS CONFIG
+# ==========================================================================
+
+DEFAULT_EDGE_VOICE = (
+    "en-US-AriaNeural"
+)
+
+# English narration is slightly slower for more natural pacing.
+ENGLISH_TTS_RATE = "-8%"
+
+# Other languages remain at normal speed.
+DEFAULT_TTS_RATE = "+0%"
+
+
+# ==========================================================================
+# YOUTUBE / PROXY CONFIG
+# ==========================================================================
+
+TEST_VIDEO_ID = "dQw4w9WgXcQ"
+
+PROXY_SCHEMES_TO_TRY = [
+    "http",
+    "socks5",
+    "socks4",
+]
+
+MAX_CONCURRENT_PROXY_CHECKS = int(
+    os.environ.get(
+        "PROXY_CHECK_CONCURRENCY",
+        "50",
+    )
+)
+
+PROXY_CHECK_CONNECT_TIMEOUT = float(
+    os.environ.get(
+        "PROXY_CHECK_CONNECT_TIMEOUT",
+        "5",
+    )
+)
+
+PROXY_CHECK_READ_TIMEOUT = float(
+    os.environ.get(
+        "PROXY_CHECK_READ_TIMEOUT",
+        "10",
+    )
+)
+
+PROXY_CHECK_RETRY_DELAY = float(
+    os.environ.get(
+        "PROXY_CHECK_RETRY_DELAY",
+        "0.5",
+    )
+)
+
+PROGRESS_EDIT_INTERVAL = float(
+    os.environ.get(
+        "PROGRESS_EDIT_INTERVAL",
+        "1.5",
+    )
+)
+
+PROXY_CHECK_EXECUTOR_WORKERS = int(
+    os.environ.get(
+        "PROXY_CHECK_EXECUTOR_WORKERS",
+        str(
+            max(
+                64,
+                MAX_CONCURRENT_PROXY_CHECKS * 2,
+            )
+        ),
+    )
+)
+
+MAX_PROXY_FILE_BYTES = (
+    10 * 1024 * 1024
+)
+
+ALLOWED_PROXY_FILE_EXTS = (
+    ".txt",
+    ".csv",
+    ".list",
+    ".proxies",
+)
+
+
+# ==========================================================================
+# CURRENT PROXY
+# ==========================================================================
+
 current_proxy = {
-    "type": None,  # None | "webshare" | "generic"
-    "webshare_username": os.environ.get("WEBSHARE_PROXY_USERNAME", ""),
-    "webshare_password": os.environ.get("WEBSHARE_PROXY_PASSWORD", ""),
-    "http_url": os.environ.get("PROXY_HTTP_URL", ""),
-    "https_url": os.environ.get("PROXY_HTTPS_URL", ""),
+    "type": None,
+
+    "webshare_username": os.environ.get(
+        "WEBSHARE_PROXY_USERNAME",
+        "",
+    ).strip(),
+
+    "webshare_password": os.environ.get(
+        "WEBSHARE_PROXY_PASSWORD",
+        "",
+    ).strip(),
+
+    "http_url": os.environ.get(
+        "PROXY_HTTP_URL",
+        "",
+    ).strip(),
+
+    "https_url": os.environ.get(
+        "PROXY_HTTPS_URL",
+        "",
+    ).strip(),
 }
-if current_proxy["webshare_username"] and current_proxy["webshare_password"]:
+
+
+if (
+    current_proxy["webshare_username"]
+    and current_proxy["webshare_password"]
+):
+
     current_proxy["type"] = "webshare"
-elif current_proxy["http_url"] or current_proxy["https_url"]:
+
+elif (
+    current_proxy["http_url"]
+    or current_proxy["https_url"]
+):
+
     current_proxy["type"] = "generic"
 
 
-def is_owner(update: Update) -> bool:
-    """No OWNER_ID configured = single-user/personal bot, anyone can manage the proxy."""
+# ==========================================================================
+# QUICK MODEL OPTIONS
+# ==========================================================================
+
+QUICK_MODELS = [
+    (
+        "Nemotron 3 Ultra",
+        "nvidia/nemotron-3-ultra-550b-a55b",
+    ),
+    (
+        "Llama 3.1 70B",
+        "meta/llama-3.1-70b-instruct",
+    ),
+    (
+        "Llama 3.1 8B",
+        "meta/llama-3.1-8b-instruct",
+    ),
+    (
+        "Mixtral 8x22B",
+        "mistralai/mixtral-8x22b-instruct-v0.1",
+    ),
+]
+
+
+# ==========================================================================
+# QUICK LANGUAGES
+# ==========================================================================
+
+QUICK_LANGUAGES = [
+    "Hindi",
+    "English",
+    "Urdu",
+    "Spanish",
+    "French",
+    "Arabic",
+    "Bengali",
+    "Chinese",
+    "Japanese",
+    "German",
+    "Russian",
+    "Portuguese",
+]
+
+
+# ==========================================================================
+# QUICK VOICES
+# ==========================================================================
+
+QUICK_VOICES = [
+    (
+        "English (US, F)",
+        "en-US-AriaNeural",
+    ),
+    (
+        "English (US, M)",
+        "en-US-GuyNeural",
+    ),
+    (
+        "English (UK, M)",
+        "en-GB-RyanNeural",
+    ),
+    (
+        "Hindi (F)",
+        "hi-IN-SwaraNeural",
+    ),
+    (
+        "Hindi (M)",
+        "hi-IN-MadhurNeural",
+    ),
+    (
+        "Urdu (M)",
+        "ur-PK-AsadNeural",
+    ),
+    (
+        "Spanish (F)",
+        "es-ES-ElviraNeural",
+    ),
+    (
+        "Arabic (M)",
+        "ar-SA-HamedNeural",
+    ),
+]
+
+
+# ==========================================================================
+# YOUTUBE URL
+# ==========================================================================
+
+YOUTUBE_URL_PATTERN = re.compile(
+    r"(?:https?://)?"
+    r"(?:www\.)?"
+    r"(?:youtube\.com|youtu\.be|m\.youtube\.com)"
+    r"/[\w\-./?=&%]+",
+    re.IGNORECASE,
+)
+
+
+# ==========================================================================
+# PROXY STATE
+# ==========================================================================
+
+def is_owner(
+    update: Update,
+) -> bool:
+
     if OWNER_ID is None:
         return True
-    return bool(update.effective_user) and update.effective_user.id == OWNER_ID
+
+    user = update.effective_user
+
+    return bool(
+        user
+        and user.id == OWNER_ID
+    )
 
 
-def describe_current_proxy(reveal: bool = False) -> str:
+def describe_current_proxy(
+    reveal: bool = False,
+) -> str:
+
     if current_proxy["type"] == "webshare":
-        user = current_proxy["webshare_username"] or "(unset)"
-        if not reveal and len(user) > 4:
-            user = user[:2] + "…" + user[-2:]
-        return f"Webshare ({user})"
+
+        user = (
+            current_proxy[
+                "webshare_username"
+            ]
+            or "(unset)"
+        )
+
+        if (
+            not reveal
+            and len(user) > 4
+        ):
+
+            user = (
+                user[:2]
+                + "…"
+                + user[-2:]
+            )
+
+        return (
+            f"Webshare ({user})"
+        )
+
     if current_proxy["type"] == "generic":
-        url = current_proxy["http_url"] or current_proxy["https_url"] or "(unset)"
+
+        url = (
+            current_proxy["http_url"]
+            or current_proxy["https_url"]
+            or "(unset)"
+        )
+
         if not reveal:
-            url = re.sub(r"//[^@]+@", "//***:***@", url)  # mask user:pass@ in the URL
-        return f"Generic ({url})"
-    return "None — connecting directly"
+
+            url = re.sub(
+                r"//[^@]+@",
+                "//***:***@",
+                url,
+            )
+
+        return (
+            f"Generic ({url})"
+        )
+
+    return (
+        "None — connecting directly"
+    )
 
 
-def build_youtube_api() -> YouTubeTranscriptApi:
-    """Instance YouTubeTranscriptApi, proxied per the current live config."""
-    if current_proxy["type"] == "webshare":
-        from youtube_transcript_api.proxies import WebshareProxyConfig
+# ==========================================================================
+# YOUTUBE API
+# ==========================================================================
+
+def build_youtube_api():
+
+    if (
+        current_proxy["type"]
+        == "webshare"
+    ):
+
+        from youtube_transcript_api.proxies import (
+            WebshareProxyConfig,
+        )
+
         return YouTubeTranscriptApi(
             proxy_config=WebshareProxyConfig(
-                proxy_username=current_proxy["webshare_username"],
-                proxy_password=current_proxy["webshare_password"],
+                proxy_username=(
+                    current_proxy[
+                        "webshare_username"
+                    ]
+                ),
+                proxy_password=(
+                    current_proxy[
+                        "webshare_password"
+                    ]
+                ),
             )
         )
-    if current_proxy["type"] == "generic":
-        from youtube_transcript_api.proxies import GenericProxyConfig
+
+    if (
+        current_proxy["type"]
+        == "generic"
+    ):
+
+        from youtube_transcript_api.proxies import (
+            GenericProxyConfig,
+        )
+
         return YouTubeTranscriptApi(
             proxy_config=GenericProxyConfig(
-                http_url=current_proxy["http_url"] or None,
-                https_url=current_proxy["https_url"] or None,
+                http_url=(
+                    current_proxy[
+                        "http_url"
+                    ]
+                    or None
+                ),
+                https_url=(
+                    current_proxy[
+                        "https_url"
+                    ]
+                    or None
+                ),
             )
         )
+
     return YouTubeTranscriptApi()
 
 
-def test_proxy_against_youtube() -> None:
-    """FULL smoke test: fetch a real transcript for a known-good video through
-    whatever proxy is currently ACTIVE. Slow (2-3 requests through the
-    transcript library, 30-60s timeouts) — used only for a single proxy, by
-    /checkproxy and /setproxy verification. Raises on failure; run via executor."""
-    ytt_api = build_youtube_api()
-    transcript_list = ytt_api.list(TEST_VIDEO_ID)
+# ==========================================================================
+# FULL PROXY TEST
+# ==========================================================================
+
+def test_proxy_against_youtube():
+
+    api = build_youtube_api()
+
+    transcript_list = api.list(
+        TEST_VIDEO_ID
+    )
+
     try:
-        transcript = next(iter(transcript_list))
+
+        transcript = next(
+            iter(transcript_list)
+        )
+
     except StopIteration as exc:
-        raise RuntimeError("Test video returned no transcript tracks.") from exc
+
+        raise RuntimeError(
+            "Test video returned no "
+            "transcript tracks."
+        ) from exc
+
     transcript.fetch()
 
 
-def test_proxy_via_urls(http_url: str, https_url: str) -> None:
-    """
-    LIGHTWEIGHT bulk check: a single HTTP request to YouTube's oembed endpoint
-    through the candidate proxy, with short timeouts.
+# ==========================================================================
+# LIGHT PROXY TEST
+# ==========================================================================
 
-    Why not use youtube_transcript_api here? Because a full transcript fetch
-    makes 2-3 round trips with 30-60s default timeouts — a dead proxy would
-    hang for a full minute before failing, capping bulk throughput at ~1/s
-    regardless of concurrency. A single short-timeout request fails dead
-    proxies in ~5s and multiplies throughput 10-20x.
+def test_proxy_via_urls(
+    http_url: str,
+    https_url: str,
+):
 
-    This checks REACHABILITY, not that YouTube will serve a transcript
-    through that particular IP. The winning proxy is re-verified with the
-    full test (test_proxy_against_youtube) before it's activated.
-    """
     proxies = {}
+
     if http_url:
         proxies["http"] = http_url
+
     if https_url:
         proxies["https"] = https_url
 
     try:
-        resp = requests.get(
+
+        response = requests.get(
             "https://www.youtube.com/oembed",
-            params={"url": f"https://youtu.be/{TEST_VIDEO_ID}", "format": "json"},
-            proxies=proxies or None,
-            timeout=(PROXY_CHECK_CONNECT_TIMEOUT, PROXY_CHECK_READ_TIMEOUT),
-            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+            params={
+                "url": (
+                    "https://youtu.be/"
+                    + TEST_VIDEO_ID
+                ),
+                "format": "json",
+            },
+            proxies=(
+                proxies
+                if proxies
+                else None
+            ),
+            timeout=(
+                PROXY_CHECK_CONNECT_TIMEOUT,
+                PROXY_CHECK_READ_TIMEOUT,
+            ),
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(X11; Linux x86_64) "
+                    "AppleWebKit/537.36"
+                )
+            },
             allow_redirects=True,
         )
+
     except requests.exceptions.ProxyError as exc:
-        raise RuntimeError(f"proxy connect failed: {exc}") from exc
+
+        raise RuntimeError(
+            f"proxy connect failed: {exc}"
+        ) from exc
+
     except requests.exceptions.ConnectTimeout as exc:
-        raise RuntimeError(f"connect timeout ({PROXY_CHECK_CONNECT_TIMEOUT}s)") from exc
+
+        raise RuntimeError(
+            "connect timeout"
+        ) from exc
+
     except requests.exceptions.ReadTimeout as exc:
-        raise RuntimeError(f"read timeout ({PROXY_CHECK_READ_TIMEOUT}s)") from exc
-    except requests.exceptions.SSLError as exc:
-        raise RuntimeError(f"SSL error: {exc}") from exc
+
+        raise RuntimeError(
+            "read timeout"
+        ) from exc
+
     except requests.exceptions.ConnectionError as exc:
-        raise RuntimeError(f"connection error: {exc}") from exc
 
-    if resp.status_code == 429:
-        raise RuntimeError("rate-limited by YouTube (proxy reachable but throttled)")
-    if resp.status_code >= 500:
-        raise RuntimeError(f"upstream {resp.status_code}")
-    resp.raise_for_status()
+        raise RuntimeError(
+            f"connection error: {exc}"
+        ) from exc
 
+    if response.status_code == 429:
+
+        raise RuntimeError(
+            "rate-limited by YouTube"
+        )
+
+    if response.status_code >= 500:
+
+        raise RuntimeError(
+            f"upstream {response.status_code}"
+        )
+
+    response.raise_for_status()
+
+
+# ==========================================================================
+# PROXY URL
+# ==========================================================================
 
 def build_generic_proxy_urls(
-    host: str, port: str, user: str | None, password: str | None, scheme: str
-) -> tuple[str, str]:
-    auth = f"{user}:{password}@" if user and password else ""
-    url = f"{scheme}://{auth}{host}:{port}"
+    host: str,
+    port: str,
+    user: str | None,
+    password: str | None,
+    scheme: str,
+):
+
+    auth = ""
+
+    if user and password:
+
+        auth = (
+            f"{user}:{password}@"
+        )
+
+    url = (
+        f"{scheme}://"
+        f"{auth}"
+        f"{host}:{port}"
+    )
+
     return url, url
 
 
-# ----------------------------------------------------------------------
-# Proxy string parsing
-# ----------------------------------------------------------------------
+# ==========================================================================
+# PROXY PARSING
+# ==========================================================================
 
 _SCHEME_PREFIX_RE = re.compile(
-    r"^(?P<scheme>https?|socks5h?|socks4a?|socks4)://(?P<rest>.+)$",
+    r"^(?P<scheme>"
+    r"https?|"
+    r"socks5h?|"
+    r"socks4a?|"
+    r"socks4"
+    r")://"
+    r"(?P<rest>.+)$",
     re.IGNORECASE,
 )
+
 _USERPASS_AT_RE = re.compile(
-    r"^(?P<user>[^:@\s]+):(?P<pw>[^:@\s]+)@(?P<host>[\w.\-]+):(?P<port>\d{2,5})$"
+    r"^(?P<user>[^:@\s]+):"
+    r"(?P<pw>[^:@\s]+)@"
+    r"(?P<host>[\w.\-]+):"
+    r"(?P<port>\d{2,5})$"
 )
-_INLINE_SEP_RE = re.compile(r"[,;\t]")
+
+_INLINE_SEP_RE = re.compile(
+    r"[,;\t]"
+)
 
 
-def _parse_hostport_pair(raw: str) -> tuple[str, str, str | None, str | None] | None:
-    """(host, port, user|None, pass|None) or None. No scheme handling here."""
-    raw = raw.strip().strip("'\"")
-    m = _USERPASS_AT_RE.match(raw)
-    if m:
-        return m.group("host"), m.group("port"), m.group("user"), m.group("pw")
+def _parse_hostport_pair(
+    raw: str,
+):
+
+    raw = (
+        raw
+        .strip()
+        .strip("'\"")
+    )
+
+    match = _USERPASS_AT_RE.match(
+        raw
+    )
+
+    if match:
+
+        return (
+            match.group("host"),
+            match.group("port"),
+            match.group("user"),
+            match.group("pw"),
+        )
 
     parts = raw.split(":")
-    if len(parts) == 2 and parts[1].isdigit():
-        return parts[0], parts[1], None, None            # host:port
+
+    if (
+        len(parts) == 2
+        and parts[1].isdigit()
+    ):
+
+        return (
+            parts[0],
+            parts[1],
+            None,
+            None,
+        )
+
     if len(parts) == 4:
+
         a, b, c, d = parts
+
         if b.isdigit():
-            return a, b, c, d                            # host:port:user:pass
+
+            return (
+                a,
+                b,
+                c,
+                d,
+            )
+
         if d.isdigit():
-            return c, d, a, b                            # user:pass:host:port
+
+            return (
+                c,
+                d,
+                a,
+                b,
+            )
+
     return None
 
 
 def parse_proxy_input(
     raw: str,
-) -> tuple[str, str, str | None, str | None, str | None] | None:
-    """
-    (host, port, user|None, pass|None, forced_scheme|None) or None.
-    forced_scheme is set only when the input explicitly had one — otherwise
-    every scheme in PROXY_SCHEMES_TO_TRY is worth trying.
-    """
-    raw = raw.strip().strip("'\"")
+):
+
+    raw = (
+        raw
+        .strip()
+        .strip("'\"")
+    )
+
     if not raw:
         return None
 
-    m = _SCHEME_PREFIX_RE.match(raw)
-    if m:
-        inner = _parse_hostport_pair(m.group("rest"))
+    match = _SCHEME_PREFIX_RE.match(
+        raw
+    )
+
+    if match:
+
+        inner = _parse_hostport_pair(
+            match.group("rest")
+        )
+
         if inner is None:
             return None
-        host, port, user, pw = inner
-        return host, port, user, pw, m.group("scheme").lower()
 
-    inner = _parse_hostport_pair(raw)
+        host, port, user, pw = inner
+
+        return (
+            host,
+            port,
+            user,
+            pw,
+            match.group("scheme").lower(),
+        )
+
+    inner = _parse_hostport_pair(
+        raw
+    )
+
     if inner is None:
         return None
+
     host, port, user, pw = inner
-    return host, port, user, pw, None
 
-
-def parse_proxy_lines(raw_text: str) -> list[str]:
-    """
-    Turn a pasted / uploaded blob into a clean list of candidate strings.
-
-    Contract:
-      * one proxy per line is the primary format
-      * blank lines, full-line comments (#, //) and trailing # comments are ignored
-      * if a line has commas/semicolons/tabs and doesn't parse as-is, split it
-        (covers CSV exports and "one line, many proxies" pastes)
-      * duplicates are dropped, order preserved
-    """
-    seen: set[str] = set()
-    out: list[str] = []
-    for raw_line in raw_text.splitlines():
-        line = raw_line.split("#", 1)[0].strip()
-        if not line or line.startswith("//"):
-            continue
-
-        candidates = [line]
-        if parse_proxy_input(line) is None and _INLINE_SEP_RE.search(line):
-            candidates = [tok.strip() for tok in _INLINE_SEP_RE.split(line) if tok.strip()]
-
-        for cand in candidates:
-            if cand and cand not in seen:
-                seen.add(cand)
-                out.append(cand)
-    return out
-
-
-# ----------------------------------------------------------------------
-# Proxy auto-detection (single proxy, from /setproxy)
-# ----------------------------------------------------------------------
-
-async def auto_configure_proxy(
-    chat,
-    host: str,
-    port: str,
-    user: str | None,
-    password: str | None,
-    forced_scheme: str | None = None,
-):
-    """
-    Try each candidate protocol (or just the one the input specified) against
-    a live YouTube fetch, and activate the first one that actually works.
-    Global state is untouched until a working scheme is confirmed.
-    """
-    schemes = [forced_scheme] if forced_scheme else PROXY_SCHEMES_TO_TRY
-    status_msg = await chat.send_message(f"Auto-detecting proxy protocol for {host}:{port}…")
-
-    loop = asyncio.get_running_loop()
-    attempts = []
-    for scheme in schemes:
-        http_url, https_url = build_generic_proxy_urls(host, port, user, password, scheme)
-        try:
-            # Use the full test — this is a single proxy, correctness matters.
-            await loop.run_in_executor(None, test_proxy_via_urls, http_url, https_url)
-        except (RequestBlocked, IpBlocked):
-            attempts.append(f"{scheme}:// → blocked by YouTube")
-            continue
-        except Exception as exc:  # noqa: BLE001
-            attempts.append(f"{scheme}:// → {type(exc).__name__}: {exc}")
-            continue
-
-        current_proxy.update(
-            type="generic", http_url=http_url, https_url=https_url,
-            webshare_username="", webshare_password="",
-        )
-        await status_msg.edit_text(
-            f"✅ Working via {scheme}:// — proxy set: {describe_current_proxy()}"
-        )
-        return
-
-    report = "\n".join(attempts)
-    await status_msg.edit_text(
-        f"❌ {host}:{port} didn't work on {'/'.join(schemes)}:\n\n{report}\n\n"
-        "Try a different proxy, or double-check the credentials."
+    return (
+        host,
+        port,
+        user,
+        pw,
+        None,
     )
 
 
-# --- NVIDIA NIM (translation) config -----------------------------------
-NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
-NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-NVIDIA_MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
-# Just a starting default — /model (or the buttons) let a chat switch to any
-# model ID at all, nothing is hardcoded or restricted.
-DEFAULT_NVIDIA_MODEL = "meta/llama-3.1-70b-instruct"
+def parse_proxy_lines(
+    raw_text: str,
+):
 
-# --- Edge TTS (voice generation) config ---------------------------------
-# No API key needed. /setvoice accepts any edge-tts voice ID — nothing
-# hardcoded or restricted; browse the real list with /voices <filter>.
-DEFAULT_EDGE_VOICE = "en-US-AriaNeural"
+    seen = set()
+    output = []
 
-YOUTUBE_URL_PATTERN = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:youtube\.com|youtu\.be|m\.youtube\.com)/[\w\-./?=&%]+",
-    re.IGNORECASE,
-)
+    for raw_line in raw_text.splitlines():
 
-# Quick-pick shortcuts shown as buttons — these never limit what you can
-# type manually via /model or /setvoice, they're just one-tap defaults.
-QUICK_LANGUAGES = [
-    "Hindi", "English", "Urdu", "Spanish",
-    "French", "Arabic", "Bengali", "Chinese",
-    "Japanese", "German", "Russian", "Portuguese",
-]
+        line = raw_line.split(
+            "#",
+            1,
+        )[0].strip()
 
-QUICK_MODELS = [
-    ("Llama 3.1 70B", "meta/llama-3.1-70b-instruct"),
-    ("Llama 3.1 8B", "meta/llama-3.1-8b-instruct"),
-    ("Nemotron 70B", "nvidia/llama-3.1-nemotron-70b-instruct"),
-    ("Mixtral 8x22B", "mistralai/mixtral-8x22b-instruct-v0.1"),
-    ("Gemma 2 27B", "google/gemma-2-27b-it"),
-]
+        if not line:
+            continue
 
-QUICK_VOICES = [
-    ("English (US, F)", "en-US-AriaNeural"),
-    ("English (UK, M)", "en-GB-RyanNeural"),
-    ("Hindi (F)", "hi-IN-SwaraNeural"),
-    ("Hindi (M)", "hi-IN-MadhurNeural"),
-    ("Urdu (M)", "ur-PK-AsadNeural"),
-    ("Spanish (F)", "es-ES-ElviraNeural"),
-    ("Arabic (M)", "ar-SA-HamedNeural"),
-]
+        if line.startswith("//"):
+            continue
 
+        candidates = [line]
 
-# --- Keyboards -------------------------------------------------------------
+        if (
+            parse_proxy_input(line)
+            is None
+            and _INLINE_SEP_RE.search(line)
+        ):
 
-def build_main_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📄 Get a transcript", callback_data="menu:transcript")],
-        [InlineKeyboardButton("🌐 Translate last transcript", callback_data="menu:translate")],
-        [InlineKeyboardButton("🔊 Narrate last transcript", callback_data="menu:voice")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="menu:settings")],
-    ])
+            candidates = [
+                token.strip()
+                for token
+                in _INLINE_SEP_RE.split(line)
+                if token.strip()
+            ]
 
-
-def build_post_transcript_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🌐 Translate", callback_data="menu:translate"),
-        InlineKeyboardButton("🔊 Narrate", callback_data="narrate:original"),
-    ]])
-
-
-def build_post_translate_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔊 Narrate this", callback_data="narrate:translated"),
-        InlineKeyboardButton("🌐 Another language", callback_data="menu:translate"),
-    ]])
-
-
-def build_language_keyboard() -> InlineKeyboardMarkup:
-    buttons = [InlineKeyboardButton(lang, callback_data=f"lang:{lang}") for lang in QUICK_LANGUAGES]
-    rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
-    rows.append([InlineKeyboardButton("✍️ Type a different language", callback_data="lang:custom")])
-    return InlineKeyboardMarkup(rows)
-
-
-def build_model_keyboard() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(label, callback_data=f"setmodel:{model_id}")] for label, model_id in QUICK_MODELS]
-    rows.append([InlineKeyboardButton("📜 Browse every model", callback_data="models:list")])
-    return InlineKeyboardMarkup(rows)
-
-
-def build_voice_keyboard() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(label, callback_data=f"setvoice:{voice_id}")] for label, voice_id in QUICK_VOICES]
-    rows.append([InlineKeyboardButton("📜 Browse every voice", callback_data="voices:list")])
-    return InlineKeyboardMarkup(rows)
-
-
-def build_settings_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧠 Change model", callback_data="changemodel")],
-        [InlineKeyboardButton("🎙 Change voice", callback_data="changevoice")],
-    ])
-
-
-def build_stop_keyboard(run_id: str) -> InlineKeyboardMarkup:
-    """Inline keyboard attached to the bulk-check progress message so a long
-    run can be cancelled with one tap. run_id makes sure a stale button from
-    an earlier (already-finished) run can't stop the current one."""
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🛑 Stop", callback_data=f"stopbulk:{run_id}")
-    ]])
-
-
-# --- Text chunking for Telegram's 4096-char message cap -----------------
-
-def chunk_lines(lines: list[str], max_chars: int = 3800) -> list[str]:
-    """Split a list of lines into chunks that never cut a line in half."""
-    chunks, current = [], ""
-    for line in lines:
-        if current and len(current) + 1 + len(line) > max_chars:
-            chunks.append(current)
-            current = line
-        else:
-            current = f"{current}\n{line}" if current else line
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-# --- Progress bar for the bulk proxy check ------------------------------
-
-def format_duration(seconds: float) -> str:
-    s = int(max(0, seconds))
-    if s < 60:
-        return f"{s}s"
-    m, s = divmod(s, 60)
-    if m < 60:
-        return f"{m}m{s:02d}s"
-    h, m = divmod(m, 60)
-    return f"{h}h{m:02d}m"
-
-
-class ProgressTracker:
-    """Live progress bar for the bulk proxy check.
-
-    Edits the status message at most once every PROGRESS_EDIT_INTERVAL seconds
-    so a large run doesn't trip Telegram's edit rate limit but still looks
-    live. The final tick always forces an edit so the bar lands on 100%.
-    When a stop_event is supplied and fires, the very next tick bypasses the
-    throttle so the message immediately reflects "stopping".
-    """
-
-    def __init__(
-        self,
-        total: int,
-        status_msg,
-        header: str,
-        reply_markup: InlineKeyboardMarkup | None = None,
-        stop_event: asyncio.Event | None = None,
-    ):
-        self.total = total
-        self.status_msg = status_msg
-        self.header = header
-        self.reply_markup = reply_markup
-        self.stop_event = stop_event
-        self.done = 0
-        self.passed = 0
-        self.failed = 0
-        self.skipped = 0
-        self.started = asyncio.get_running_loop().time()
-        self._lock = asyncio.Lock()
-        self._last_edit = 0.0
-        self._showed_stopping = False
-
-    async def tick(self, ok: bool, skipped: bool = False) -> None:
-        async with self._lock:
-            self.done += 1
-            if skipped:
-                self.skipped += 1
-            elif ok:
-                self.passed += 1
-            else:
-                self.failed += 1
-
-            now = asyncio.get_running_loop().time()
-            is_last = self.done >= self.total
-            stopping_now = self.stop_event is not None and self.stop_event.is_set()
-            just_started_stopping = stopping_now and not self._showed_stopping
-            if just_started_stopping:
-                self._showed_stopping = True
+        for candidate in candidates:
 
             if (
-                not is_last
-                and not just_started_stopping
-                and (now - self._last_edit) < PROGRESS_EDIT_INTERVAL
+                candidate
+                and candidate not in seen
             ):
-                return
-            self._last_edit = now
 
-        try:
-            await self.status_msg.edit_text(self._render(), reply_markup=self.reply_markup)
-        except Exception:
-            pass  # message edited/deleted elsewhere — never fatal
+                seen.add(candidate)
+                output.append(candidate)
 
-    def _render(self) -> str:
-        width = 18
-        ratio = self.done / self.total if self.total else 0.0
-        filled = int(width * ratio)
-        bar = "█" * filled + "░" * (width - filled)
-        pct = ratio * 100
-
-        elapsed = asyncio.get_running_loop().time() - self.started
-        rate = self.done / elapsed if elapsed > 0 and self.done > 0 else 0.0
-        remaining = self.total - self.done
-        eta = remaining / rate if rate > 0 else 0.0
-
-        lines = [
-            self.header,
-            "",
-            f"`[{bar}]` {pct:5.1f}%",
-            f"✅ {self.passed} working   ❌ {self.failed} failed",
-            f"⚡ {rate:0.1f}/s   ⏳ ETA {format_duration(eta)}",
-        ]
-        if self.skipped:
-            lines.append(f"⏭ {self.skipped} skipped")
-        if self.stop_event is not None and self.stop_event.is_set():
-            lines.append("🛑 Stopping…")
-        return "\n".join(lines)
+    return output
 
 
-# --- YouTube transcript helpers ---------------------------------------
+# ==========================================================================
+# VIDEO ID
+# ==========================================================================
 
-def extract_video_id(url: str) -> str | None:
-    """Pull the 11-character video ID out of any common YouTube URL shape."""
+def extract_video_id(
+    url: str,
+):
+
     url = url.strip()
-    parsed = urlparse(url if "://" in url else f"https://{url}")
-    host = (parsed.netloc or "").lower()
+
+    parsed = urlparse(
+        url
+        if "://" in url
+        else f"https://{url}"
+    )
+
+    host = (
+        parsed.netloc
+        or ""
+    ).lower()
 
     if "youtu.be" in host:
-        video_id = parsed.path.lstrip("/")
-        return video_id.split("/")[0] if video_id else None
+
+        video_id = (
+            parsed.path
+            .lstrip("/")
+        )
+
+        return (
+            video_id.split("/")[0]
+            if video_id
+            else None
+        )
 
     if "youtube.com" in host:
+
         if parsed.path == "/watch":
-            qs = parse_qs(parsed.query)
-            return qs.get("v", [None])[0]
-        # /shorts/<id>, /embed/<id>, /live/<id>
-        for prefix in ("/shorts/", "/embed/", "/live/"):
-            if parsed.path.startswith(prefix):
-                return parsed.path[len(prefix):].split("/")[0]
+
+            query = parse_qs(
+                parsed.query
+            )
+
+            return query.get(
+                "v",
+                [None],
+            )[0]
+
+        for prefix in (
+            "/shorts/",
+            "/embed/",
+            "/live/",
+        ):
+
+            if parsed.path.startswith(
+                prefix
+            ):
+
+                return (
+                    parsed.path[
+                        len(prefix):
+                    ]
+                    .split("/")[0]
+                )
 
     return None
 
 
-def fetch_transcript_text(video_id: str, preferred_langs=("en",)) -> tuple[str, str]:
-    """
-    Returns (clean_text, language_used). Tries manually-created transcripts
-    first, then falls back to auto-generated ones, in the preferred
-    languages, then finally whatever is available.
-    """
-    ytt_api = build_youtube_api()
-    transcript_list = ytt_api.list(video_id)
+# ==========================================================================
+# TRANSCRIPT CLEANING
+# ==========================================================================
 
-    transcript = None
-    try:
-        transcript = transcript_list.find_manually_created_transcript(preferred_langs)
-    except NoTranscriptFound:
-        pass
+def clean_transcript(
+    entries,
+):
 
-    if transcript is None:
-        try:
-            transcript = transcript_list.find_generated_transcript(preferred_langs)
-        except NoTranscriptFound:
-            pass
-
-    if transcript is None:
-        # last resort: grab the first transcript available, in any language
-        try:
-            transcript = next(iter(transcript_list))
-        except StopIteration as exc:
-            raise NoTranscriptFound(video_id, preferred_langs, transcript_list) from exc
-
-    raw_entries = transcript.fetch()
-    language_used = transcript.language
-
-    return clean_transcript(raw_entries), language_used
-
-
-def clean_transcript(entries) -> str:
-    """
-    Turn the list of {text, start, duration} chunks into readable
-    paragraphs: strip timestamps, fix spacing/line-break artifacts, and
-    start a new paragraph whenever there's a natural pause (>2.5s gap)
-    in the speech.
-
-    Some caption tracks (especially community-uploaded / lyric-style ones)
-    embed a literal timestamp label like "0:05" or "[1:23:45]" at the START
-    of each caption line, separate from the real start/duration timing
-    metadata. Left in, these get mistranslated and read aloud as digits by
-    TTS, so a *leading* timestamp is stripped here. Only the leading
-    position is targeted — a time mentioned naturally mid-sentence (e.g.
-    "the meeting is at 10:30") is left alone since it's real spoken
-    content, not an artifact. The real timing used for paragraph breaks
-    below always comes from entry.start/entry.duration, never the text.
-    """
     leading_timestamp = re.compile(
-        r"^[\[\(]?\d{1,2}(?::\d{2}){1,2}\b[\]\)]?\s*[-–—:]?\s*"
+        r"^[\[\(]?"
+        r"\d{1,2}"
+        r"(?::\d{2}){1,2}"
+        r"\b"
+        r"[\]\)]?"
+        r"\s*[-–—:]?\s*"
     )
 
     paragraphs = []
     current = []
+
     last_end = 0.0
 
     for entry in entries:
-        text = entry.text.replace("\n", " ").strip()
-        text = leading_timestamp.sub("", text)
-        text = re.sub(r"\s+", " ", text).strip()
+
+        text = (
+            entry.text
+            .replace("\n", " ")
+            .strip()
+        )
+
+        text = leading_timestamp.sub(
+            "",
+            text,
+        )
+
+        text = re.sub(
+            r"\s+",
+            " ",
+            text,
+        ).strip()
+
         if not text:
             continue
 
-        gap = entry.start - last_end
-        if current and gap > 2.5:
-            paragraphs.append(" ".join(current))
+        gap = (
+            entry.start
+            - last_end
+        )
+
+        if (
+            current
+            and gap > 2.5
+        ):
+
+            paragraphs.append(
+                " ".join(current)
+            )
+
             current = []
 
         current.append(text)
-        last_end = entry.start + entry.duration
+
+        last_end = (
+            entry.start
+            + entry.duration
+        )
 
     if current:
-        paragraphs.append(" ".join(current))
 
-    return "\n\n".join(paragraphs)
+        paragraphs.append(
+            " ".join(current)
+        )
 
+    return "\n\n".join(
+        paragraphs
+    )
+
+
+# ==========================================================================
+# FETCH TRANSCRIPT
+# ==========================================================================
+
+def fetch_transcript_text(
+    video_id: str,
+    preferred_langs=("en",),
+):
+
+    api = build_youtube_api()
+
+    transcript_list = api.list(
+        video_id
+    )
+
+    transcript = None
+
+    try:
+
+        transcript = (
+            transcript_list
+            .find_manually_created_transcript(
+                preferred_langs
+            )
+        )
+
+    except NoTranscriptFound:
+        pass
+
+    if transcript is None:
+
+        try:
+
+            transcript = (
+                transcript_list
+                .find_generated_transcript(
+                    preferred_langs
+                )
+            )
+
+        except NoTranscriptFound:
+            pass
+
+    if transcript is None:
+
+        try:
+
+            transcript = next(
+                iter(transcript_list)
+            )
+
+        except StopIteration as exc:
+
+            raise NoTranscriptFound(
+                video_id,
+                preferred_langs,
+                transcript_list,
+            ) from exc
+
+    raw_entries = transcript.fetch()
+
+    return (
+        clean_transcript(raw_entries),
+        transcript.language,
+    )
+
+
+# ==========================================================================
+# TRANSCRIPT ERROR HANDLING
+# ==========================================================================
 
 async def fetch_transcript_or_report(
-    chat, status_msg, url: str
-) -> tuple[str, str, str] | None:
-    """Shared fetch+error-reporting used by both /transcript and /translate flows.
-    Returns (video_id, text, language) on success, None on error (already reported)."""
-    video_id = extract_video_id(url)
-    if not video_id:
-        await status_msg.edit_text(
-            "That doesn't look like a valid YouTube URL. Try a link like "
-            "https://youtube.com/watch?v=... or https://youtu.be/..."
-        )
-        return None
-    try:
-        text, language = fetch_transcript_text(video_id)
-    except TranscriptsDisabled:
-        await status_msg.edit_text("Transcripts are disabled for this video.")
-        return None
-    except NoTranscriptFound:
-        await status_msg.edit_text("No transcript is available for this video.")
-        return None
-    except VideoUnavailable:
-        await status_msg.edit_text("That video is unavailable (private, deleted, or region-locked).")
-        return None
-    except (RequestBlocked, IpBlocked):
-        await status_msg.edit_text(
-            "YouTube is blocking this server's IP address — very common when a bot "
-            "runs on a VPS/cloud host. This isn't a one-off, it'll keep happening "
-            "until a proxy is set.\n\n"
-            "Fix: upload a .txt with working proxies and I'll test them and set "
-            "the first working one, or /setproxy <proxy> directly."
-        )
-        return None
-    except Exception as exc:  # noqa: BLE001 - surface unexpected errors to the user
-        logger.exception("Transcript fetch failed for %s", video_id)
-        await status_msg.edit_text(f"Couldn't fetch that transcript: {exc}")
-        return None
-    return video_id, text, language
+    chat,
+    status_msg,
+    url: str,
+):
 
-
-# --- NVIDIA NIM helpers ---------------------------------------------------
-
-def list_nvidia_models() -> list[str]:
-    """Live list of every model this NVIDIA API key can call — no whitelist."""
-    resp = requests.get(
-        NVIDIA_MODELS_URL,
-        headers={"Authorization": f"Bearer {NVIDIA_API_KEY}"},
-        timeout=30,
+    video_id = extract_video_id(
+        url
     )
-    resp.raise_for_status()
-    data = resp.json()
-    return sorted(m["id"] for m in data.get("data", []))
+
+    if not video_id:
+
+        await status_msg.edit_text(
+            "That doesn't look like a valid "
+            "YouTube URL."
+        )
+
+        return None
+
+    try:
+
+        text, language = (
+            fetch_transcript_text(
+                video_id
+            )
+        )
+
+    except TranscriptsDisabled:
+
+        await status_msg.edit_text(
+            "Transcripts are disabled for "
+            "this video."
+        )
+
+        return None
+
+    except NoTranscriptFound:
+
+        await status_msg.edit_text(
+            "No transcript is available "
+            "for this video."
+        )
+
+        return None
+
+    except VideoUnavailable:
+
+        await status_msg.edit_text(
+            "That video is unavailable."
+        )
+
+        return None
+
+    except (
+        RequestBlocked,
+        IpBlocked,
+    ):
+
+        await status_msg.edit_text(
+            "YouTube is blocking this "
+            "server's IP.\n\n"
+            "Upload a proxy list or use "
+            "/setproxy."
+        )
+
+        return None
+
+    except Exception as exc:
+
+        logger.exception(
+            "Transcript fetch failed"
+        )
+
+        await status_msg.edit_text(
+            f"Couldn't fetch transcript:\n"
+            f"{exc}"
+        )
+
+        return None
+
+    return (
+        video_id,
+        text,
+        language,
+    )
 
 
-def call_nvidia_chat(model: str, messages: list) -> str:
-    """One blocking call to a NIM chat-completions model. Run via executor."""
+# ==========================================================================
+# SMART TRANSLATION CHUNKER
+# ==========================================================================
+
+def split_oversized_paragraph(
+    paragraph: str,
+    max_chars: int,
+):
+
+    paragraph = paragraph.strip()
+
+    if not paragraph:
+        return []
+
+    if len(paragraph) <= max_chars:
+        return [paragraph]
+
+    # First split on sentence endings.
+    sentences = re.split(
+        r"(?<=[.!?。！？])\s+",
+        paragraph,
+    )
+
+    chunks = []
+    current = ""
+
+    for sentence in sentences:
+
+        sentence = sentence.strip()
+
+        if not sentence:
+            continue
+
+        # If a single sentence itself is huge,
+        # split it safely by whitespace.
+        if len(sentence) > max_chars:
+
+            if current:
+                chunks.append(
+                    current.strip()
+                )
+                current = ""
+
+            words = sentence.split()
+            word_chunk = ""
+
+            for word in words:
+
+                candidate = (
+                    f"{word_chunk} {word}"
+                    if word_chunk
+                    else word
+                )
+
+                if (
+                    len(candidate)
+                    > max_chars
+                ):
+
+                    if word_chunk:
+                        chunks.append(
+                            word_chunk.strip()
+                        )
+
+                    word_chunk = word
+
+                else:
+
+                    word_chunk = candidate
+
+            if word_chunk:
+                chunks.append(
+                    word_chunk.strip()
+                )
+
+            continue
+
+        candidate = (
+            f"{current} {sentence}"
+            if current
+            else sentence
+        )
+
+        if (
+            len(candidate)
+            > max_chars
+        ):
+
+            if current:
+                chunks.append(
+                    current.strip()
+                )
+
+            current = sentence
+
+        else:
+
+            current = candidate
+
+    if current:
+        chunks.append(
+            current.strip()
+        )
+
+    return chunks
+
+
+def chunk_text_for_translation(
+    text: str,
+    max_chars: int = TRANSLATION_MAX_CHARS,
+):
+
+    paragraphs = re.split(
+        r"\n\s*\n",
+        text,
+    )
+
+    chunks = []
+    current = ""
+
+    for paragraph in paragraphs:
+
+        paragraph = paragraph.strip()
+
+        if not paragraph:
+            continue
+
+        paragraph_parts = (
+            split_oversized_paragraph(
+                paragraph,
+                max_chars,
+            )
+        )
+
+        for part in paragraph_parts:
+
+            candidate = (
+                f"{current}\n\n{part}"
+                if current
+                else part
+            )
+
+            if (
+                len(candidate)
+                > max_chars
+            ):
+
+                if current:
+                    chunks.append(
+                        current.strip()
+                    )
+
+                current = part
+
+            else:
+
+                current = candidate
+
+    if current:
+        chunks.append(
+            current.strip()
+        )
+
+    return chunks or [text]
+
+
+# ==========================================================================
+# NVIDIA RATE LIMITER
+# ==========================================================================
+
+class NvidiaRateLimiter:
+
+    def __init__(
+        self,
+        interval: float,
+    ):
+
+        self.interval = interval
+
+        self.lock = asyncio.Lock()
+
+        self.last_request = 0.0
+
+    async def wait(self):
+
+        async with self.lock:
+
+            loop = asyncio.get_running_loop()
+
+            now = loop.time()
+
+            wait_time = (
+                self.interval
+                - (
+                    now
+                    - self.last_request
+                )
+            )
+
+            if wait_time > 0:
+
+                await asyncio.sleep(
+                    wait_time
+                )
+
+            self.last_request = (
+                loop.time()
+            )
+
+
+nvidia_rate_limiter = (
+    NvidiaRateLimiter(
+        NVIDIA_MIN_REQUEST_INTERVAL
+    )
+)
+
+
+# ==========================================================================
+# NVIDIA API RESPONSE
+# ==========================================================================
+
+def call_nvidia_chat(
+    model: str,
+    messages: list,
+):
+
     if not NVIDIA_API_KEY:
-        raise RuntimeError("NVIDIA_API_KEY is not set on the server.")
 
-    resp = requests.post(
+        raise RuntimeError(
+            "NVIDIA_API_KEY is not set."
+        )
+
+    response = requests.post(
         NVIDIA_CHAT_URL,
         headers={
-            "Authorization": f"Bearer {NVIDIA_API_KEY}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Authorization":
+                f"Bearer {NVIDIA_API_KEY}",
+            "Content-Type":
+                "application/json",
+            "Accept":
+                "application/json",
         },
         json={
             "model": model,
             "messages": messages,
-            "temperature": 0.2,
-            "max_tokens": 4096,
+
+            # Translation doesn't need random output.
+            "temperature": 0.15,
+
+            "top_p": 0.95,
+
+            "max_tokens":
+                TRANSLATION_MAX_TOKENS,
+
+            # Nemotron 3 Ultra supports this.
+            # We disable reasoning because this is
+            # a translation task.
+            "reasoning_effort": "none",
+
+            "stream": False,
         },
-        timeout=180,
+        timeout=300,
     )
-    if not resp.ok:
-        raise RuntimeError(f"NVIDIA API error {resp.status_code}: {resp.text[:300]}")
-    data = resp.json()
-    return data["choices"][0]["message"]["content"].strip()
+
+    if response.status_code == 429:
+
+        retry_after = (
+            response.headers.get(
+                "Retry-After"
+            )
+        )
+
+        error = RuntimeError(
+            "NVIDIA API rate limit "
+            f"(429)"
+        )
+
+        if retry_after:
+
+            setattr(
+                error,
+                "retry_after",
+                retry_after,
+            )
+
+        raise error
+
+    if (
+        response.status_code
+        >= 500
+    ):
+
+        raise RuntimeError(
+            "NVIDIA server error "
+            f"{response.status_code}: "
+            f"{response.text[:500]}"
+        )
+
+    if not response.ok:
+
+        raise RuntimeError(
+            "NVIDIA API error "
+            f"{response.status_code}: "
+            f"{response.text[:1000]}"
+        )
+
+    data = response.json()
+
+    try:
+
+        content = (
+            data["choices"][0]
+            ["message"]["content"]
+        )
+
+    except (
+        KeyError,
+        IndexError,
+        TypeError,
+    ) as exc:
+
+        raise RuntimeError(
+            "Unexpected NVIDIA response:\n"
+            f"{data}"
+        ) from exc
+
+    if content is None:
+        return ""
+
+    return content.strip()
 
 
-def chunk_text(text: str, max_chars: int = 6000) -> list[str]:
-    """Split on paragraph breaks so no single request gets too large for the model."""
-    paragraphs = text.split("\n\n")
-    chunks, current = [], ""
-    for para in paragraphs:
-        if current and len(current) + len(para) + 2 > max_chars:
-            chunks.append(current)
-            current = para
-        else:
-            current = f"{current}\n\n{para}" if current else para
-    if current:
-        chunks.append(current)
-    return chunks or [text]
+# ==========================================================================
+# NVIDIA TRANSLATION ONE CHUNK
+# ==========================================================================
 
+async def translate_single_chunk(
+    chunk: str,
+    target_language: str,
+    model: str,
+):
+
+    loop = asyncio.get_running_loop()
+
+    for attempt in range(
+        NVIDIA_MAX_RETRIES
+    ):
+
+        # --------------------------------------------------------------
+        # GLOBAL 30 RPM PACING
+        # --------------------------------------------------------------
+
+        await nvidia_rate_limiter.wait()
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a professional "
+                    "translation engine.\n\n"
+
+                    "Translate the user's text "
+                    "faithfully into the requested "
+                    "target language.\n\n"
+
+                    "Rules:\n"
+                    "1. Output ONLY the translation.\n"
+                    "2. Do not explain anything.\n"
+                    "3. Do not summarize.\n"
+                    "4. Do not add missing information.\n"
+                    "5. Preserve paragraph breaks.\n"
+                    "6. Preserve names, numbers, "
+                    "URLs and technical terms.\n"
+                    "7. Keep the meaning and tone "
+                    "of the original.\n"
+                    "8. Do not add headings unless "
+                    "they exist in the source."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Target language: "
+                    f"{target_language}\n\n"
+                    "Translate this text:\n\n"
+                    f"{chunk}"
+                ),
+            },
+        ]
+
+        try:
+
+            result = (
+                await loop.run_in_executor(
+                    None,
+                    call_nvidia_chat,
+                    model,
+                    messages,
+                )
+            )
+
+            if not result:
+
+                raise RuntimeError(
+                    "NVIDIA returned an empty "
+                    "translation."
+                )
+
+            return result
+
+        except Exception as exc:
+
+            error_text = str(exc)
+
+            is_rate_limit = (
+                "429" in error_text
+                or "rate limit"
+                in error_text.lower()
+            )
+
+            is_temporary = (
+                is_rate_limit
+                or "500" in error_text
+                or "502" in error_text
+                or "503" in error_text
+                or "504" in error_text
+                or "timeout"
+                in error_text.lower()
+                or "temporarily"
+                in error_text.lower()
+            )
+
+            if (
+                not is_temporary
+                or attempt
+                >= NVIDIA_MAX_RETRIES - 1
+            ):
+
+                raise
+
+            retry_after = getattr(
+                exc,
+                "retry_after",
+                None,
+            )
+
+            if retry_after:
+
+                try:
+
+                    delay = max(
+                        float(retry_after),
+                        NVIDIA_MIN_REQUEST_INTERVAL,
+                    )
+
+                except ValueError:
+
+                    delay = (
+                        3.0
+                        * (
+                            2 ** attempt
+                        )
+                    )
+
+            else:
+
+                delay = (
+                    3.0
+                    * (
+                        2 ** attempt
+                    )
+                )
+
+            # Add small jitter so repeated failures
+            # don't synchronize.
+            delay += (
+                secrets.randbelow(500)
+                / 1000.0
+            )
+
+            logger.warning(
+                "NVIDIA temporary error "
+                "(attempt %d/%d): %s. "
+                "Retrying in %.2fs",
+                attempt + 1,
+                NVIDIA_MAX_RETRIES,
+                exc,
+                delay,
+            )
+
+            await asyncio.sleep(
+                delay
+            )
+
+    raise RuntimeError(
+        "Translation failed after "
+        "maximum retries."
+    )
+
+
+# ==========================================================================
+# FULL TRANSLATION
+# ==========================================================================
 
 async def translate_text(
     text: str,
     target_language: str,
     model: str,
-    progress_cb: Callable[[int, int], Awaitable[None]] | None = None,
-) -> str:
-    """Translate arbitrarily long text via NVIDIA NIM, chunk by chunk, in order.
-    Optionally calls progress_cb(done, total) after each chunk."""
-    loop = asyncio.get_running_loop()
-    chunks = chunk_text(text)
+    progress_cb: Callable[
+        [int, int],
+        Awaitable[None],
+    ] | None = None,
+):
+
+    chunks = (
+        chunk_text_for_translation(
+            text,
+            TRANSLATION_MAX_CHARS,
+        )
+    )
+
     total = len(chunks)
+
+    logger.info(
+        "Translation split into %d chunks "
+        "(max %d chars/chunk)",
+        total,
+        TRANSLATION_MAX_CHARS,
+    )
+
     translated_chunks = []
-    for idx, chunk in enumerate(chunks, start=1):
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a precise professional translator. Translate the "
-                    "user's text faithfully into the requested language. Preserve "
-                    "paragraph breaks and tone. Output ONLY the translated text, "
-                    "no notes, no explanations, no original text."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Translate the following text to {target_language}:\n\n{chunk}",
-            },
-        ]
-        result = await loop.run_in_executor(None, call_nvidia_chat, model, messages)
-        translated_chunks.append(result)
-        if progress_cb is not None:
+
+    for index, chunk in enumerate(
+        chunks,
+        start=1,
+    ):
+
+        logger.info(
+            "Translating chunk %d/%d "
+            "(%d chars)",
+            index,
+            total,
+            len(chunk),
+        )
+
+        result = (
+            await translate_single_chunk(
+                chunk,
+                target_language,
+                model,
+            )
+        )
+
+        translated_chunks.append(
+            result
+        )
+
+        if progress_cb:
+
             try:
-                await progress_cb(idx, total)
+
+                await progress_cb(
+                    index,
+                    total,
+                )
+
             except Exception:
-                pass  # a failed progress ping must never kill the translation
-    return "\n\n".join(translated_chunks)
+                pass
+
+    return "\n\n".join(
+        translated_chunks
+    )
 
 
-# --- Edge TTS helpers ------------------------------------------------------
+# ==========================================================================
+# NVIDIA MODELS
+# ==========================================================================
 
-async def list_edge_voices(filter_str: str | None = None) -> list[str]:
-    """Live list of every edge-tts voice, optionally filtered — no whitelist."""
+def list_nvidia_models():
+
+    if not NVIDIA_API_KEY:
+
+        raise RuntimeError(
+            "NVIDIA_API_KEY is not configured."
+        )
+
+    response = requests.get(
+        NVIDIA_MODELS_URL,
+        headers={
+            "Authorization":
+                f"Bearer {NVIDIA_API_KEY}"
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    return sorted(
+        model["id"]
+        for model in data.get(
+            "data",
+            [],
+        )
+        if "id" in model
+    )
+
+
+# ==========================================================================
+# EDGE TTS
+# ==========================================================================
+
+async def list_edge_voices(
+    filter_str=None,
+):
+
     voices = await edge_tts.list_voices()
-    names = sorted(v["ShortName"] for v in voices)
+
+    names = sorted(
+        voice["ShortName"]
+        for voice in voices
+    )
+
     if filter_str:
-        f = filter_str.lower()
-        names = [n for n in names if f in n.lower()]
+
+        needle = filter_str.lower()
+
+        names = [
+            name
+            for name in names
+            if needle in name.lower()
+        ]
+
     return names
 
 
-async def generate_speech(text: str, voice: str, output_path: str) -> None:
-    """Render text to an mp3 with edge-tts. Handles arbitrarily long text."""
-    communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(output_path)
+def get_tts_rate(
+    voice: str,
+    source_language: str | None = None,
+):
+
+    voice_lower = (
+        voice.lower()
+    )
+
+    # English voices get slightly slower pacing.
+    if (
+        voice_lower.startswith("en-")
+        or (
+            source_language
+            and source_language.lower()
+            in (
+                "english",
+                "en",
+            )
+        )
+    ):
+
+        return ENGLISH_TTS_RATE
+
+    return DEFAULT_TTS_RATE
 
 
-# --- Shared action flows (used by both commands and inline buttons) -------
+async def generate_speech(
+    text: str,
+    voice: str,
+    output_path: str,
+    source_language: str | None = None,
+):
+
+    rate = get_tts_rate(
+        voice,
+        source_language,
+    )
+
+    logger.info(
+        "Generating TTS with voice=%s rate=%s",
+        voice,
+        rate,
+    )
+
+    communicate = edge_tts.Communicate(
+        text,
+        voice,
+        rate=rate,
+    )
+
+    await communicate.save(
+        output_path
+    )
+
+
+# ==========================================================================
+# MAIN TRANSCRIPT FLOW
+# ==========================================================================
 
 async def run_transcript_fetch(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, url: str
-) -> None:
-    chat = update.effective_chat
-    await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
-    status_msg = await chat.send_message("Fetching transcript…")
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    url: str,
+):
 
-    result = await fetch_transcript_or_report(chat, status_msg, url)
+    chat = update.effective_chat
+
+    await context.bot.send_chat_action(
+        chat_id=chat.id,
+        action=ChatAction.TYPING,
+    )
+
+    status_msg = await chat.send_message(
+        "Fetching transcript…"
+    )
+
+    result = await fetch_transcript_or_report(
+        chat,
+        status_msg,
+        url,
+    )
+
     if result is None:
         return
-    video_id, text, language = result
+
+    (
+        video_id,
+        text,
+        language,
+    ) = result
 
     if not text.strip():
-        await status_msg.edit_text("The transcript came back empty.")
+
+        await status_msg.edit_text(
+            "The transcript came back empty."
+        )
+
         return
 
-    # cache so /translate and /voice can reuse it without re-fetching
-    context.chat_data["last_transcript"] = text
-    context.chat_data["last_video_id"] = video_id
-    context.chat_data.pop("last_translation", None)
+    context.chat_data[
+        "last_transcript"
+    ] = text
 
-    file_path = f"/tmp/transcript_{video_id}.txt"
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(f"Transcript for https://youtu.be/{video_id} (language: {language})\n")
-        f.write("=" * 60 + "\n\n")
-        f.write(text)
+    context.chat_data[
+        "last_video_id"
+    ] = video_id
+
+    context.chat_data[
+        "last_source_language"
+    ] = language
+
+    context.chat_data.pop(
+        "last_translation",
+        None,
+    )
+
+    file_path = (
+        f"/tmp/transcript_"
+        f"{video_id}.txt"
+    )
+
+    with open(
+        file_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        file.write(
+            f"Transcript for "
+            f"https://youtu.be/{video_id} "
+            f"(language: {language})\n"
+        )
+
+        file.write(
+            "=" * 60
+            + "\n\n"
+        )
+
+        file.write(text)
 
     try:
+
         await status_msg.delete()
-        with open(file_path, "rb") as f:
+
+        with open(
+            file_path,
+            "rb",
+        ) as file:
+
             await context.bot.send_document(
                 chat_id=chat.id,
-                document=f,
-                filename=f"transcript_{video_id}.txt",
-                caption=f"Transcript ready ({language}). What next?",
-                reply_markup=build_post_transcript_keyboard(),
+                document=file,
+                filename=(
+                    f"transcript_{video_id}.txt"
+                ),
+                caption=(
+                    f"Transcript ready "
+                    f"({language})."
+                ),
+                reply_markup=(
+                    build_post_transcript_keyboard()
+                ),
             )
+
     finally:
+
         try:
             os.remove(file_path)
         except OSError:
             pass
 
+
+# ==========================================================================
+# TRANSLATION FLOW
+# ==========================================================================
 
 async def run_translation(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     target_language: str,
     url: str | None,
-) -> None:
+):
+
     chat = update.effective_chat
+
     if not NVIDIA_API_KEY:
-        await chat.send_message("NVIDIA_API_KEY is not set on the server.")
+
+        await chat.send_message(
+            "NVIDIA_API_KEY is not set."
+        )
+
         return
 
     if url:
-        status_msg = await chat.send_message("Fetching transcript…")
-        result = await fetch_transcript_or_report(chat, status_msg, url)
+
+        status_msg = await chat.send_message(
+            "Fetching transcript…"
+        )
+
+        result = await fetch_transcript_or_report(
+            chat,
+            status_msg,
+            url,
+        )
+
         if result is None:
             return
-        video_id, text, _ = result
-        context.chat_data["last_transcript"] = text
-        context.chat_data["last_video_id"] = video_id
+
+        (
+            video_id,
+            text,
+            source_language,
+        ) = result
+
+        context.chat_data[
+            "last_transcript"
+        ] = text
+
+        context.chat_data[
+            "last_video_id"
+        ] = video_id
+
+        context.chat_data[
+            "last_source_language"
+        ] = source_language
+
     else:
-        text = context.chat_data.get("last_transcript")
-        video_id = context.chat_data.get("last_video_id", "transcript")
-        if not text:
-            await chat.send_message(
-                "No transcript on file yet. Send a YouTube link first, or run "
-                "/translate <language> <url> directly."
+
+        text = context.chat_data.get(
+            "last_transcript"
+        )
+
+        video_id = context.chat_data.get(
+            "last_video_id",
+            "transcript",
+        )
+
+        source_language = (
+            context.chat_data.get(
+                "last_source_language"
             )
+        )
+
+        if not text:
+
+            await chat.send_message(
+                "No transcript on file yet. "
+                "Send a YouTube link first."
+            )
+
             return
-        status_msg = await chat.send_message("Translating…")
 
-    model = context.chat_data.get("nvidia_model", DEFAULT_NVIDIA_MODEL)
-    await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
-    await status_msg.edit_text(f"Translating with {model}…")
+        status_msg = await chat.send_message(
+            "Preparing translation…"
+        )
 
-    async def on_chunk_progress(done: int, total: int) -> None:
+    model = context.chat_data.get(
+        "nvidia_model",
+        DEFAULT_NVIDIA_MODEL,
+    )
+
+    chunks = (
+        chunk_text_for_translation(
+            text,
+            TRANSLATION_MAX_CHARS,
+        )
+    )
+
+    total_chunks = len(chunks)
+
+    estimated_seconds = (
+        max(
+            0,
+            total_chunks - 1,
+        )
+        * NVIDIA_MIN_REQUEST_INTERVAL
+    )
+
+    estimated_minutes = (
+        estimated_seconds / 60
+    )
+
+    await status_msg.edit_text(
+        "Translation started.\n\n"
+        f"Model: {model}\n"
+        f"Chunks: {total_chunks}\n"
+        f"Chunk size: ~{TRANSLATION_MAX_CHARS} "
+        "characters\n"
+        f"Rate protection: "
+        f"~{NVIDIA_MIN_REQUEST_INTERVAL:.1f}s "
+        "between requests\n"
+        f"Minimum pacing estimate: "
+        f"~{estimated_minutes:.1f} min"
+    )
+
+    async def progress(
+        done: int,
+        total: int,
+    ):
+
+        remaining = max(
+            0,
+            total - done,
+        )
+
+        remaining_seconds = (
+            remaining
+            * NVIDIA_MIN_REQUEST_INTERVAL
+        )
+
         try:
-            await status_msg.edit_text(f"Translating with {model}… ({done}/{total})")
+
+            await status_msg.edit_text(
+                "Translating long transcript…\n\n"
+                f"Model: {model}\n"
+                f"Progress: "
+                f"{done}/{total} chunks\n"
+                f"Remaining: "
+                f"{format_duration("
+                    remaining_seconds
+                )}\n"
+                f"Rate: "
+                f"~{60 / NVIDIA_MIN_REQUEST_INTERVAL:.1f}"
+                " requests/min"
+            )
+
         except Exception:
-            pass  # edit raced with something else; not fatal
+            pass
 
     try:
-        translated = await translate_text(text, target_language, model, on_chunk_progress)
+
+        translated = (
+            await translate_text(
+                text,
+                target_language,
+                model,
+                progress,
+            )
+        )
+
     except Exception as exc:
-        logger.exception("Translation failed")
-        await status_msg.edit_text(f"Translation failed: {exc}")
+
+        logger.exception(
+            "Translation failed"
+        )
+
+        await status_msg.edit_text(
+            "Translation failed:\n\n"
+            f"{exc}"
+        )
+
         return
 
-    safe_lang = re.sub(r"[^A-Za-z0-9]+", "_", target_language).strip("_") or "translated"
-    context.chat_data["last_translation"] = translated
-    file_path = f"/tmp/transcript_{video_id}_{safe_lang}.txt"
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(f"Translated transcript — target language: {target_language} — model: {model}\n")
-        f.write("=" * 60 + "\n\n")
-        f.write(translated)
+    context.chat_data[
+        "last_translation"
+    ] = translated
+
+    context.chat_data[
+        "last_translation_language"
+    ] = target_language
+
+    safe_language = re.sub(
+        r"[^A-Za-z0-9]+",
+        "_",
+        target_language,
+    ).strip("_")
+
+    if not safe_language:
+        safe_language = "translated"
+
+    file_path = (
+        f"/tmp/transcript_"
+        f"{video_id}_"
+        f"{safe_language}.txt"
+    )
+
+    with open(
+        file_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        file.write(
+            "Translated transcript\n"
+        )
+
+        file.write(
+            f"Target language: "
+            f"{target_language}\n"
+        )
+
+        file.write(
+            f"Source language: "
+            f"{source_language or 'unknown'}\n"
+        )
+
+        file.write(
+            f"Model: {model}\n"
+        )
+
+        file.write(
+            f"Chunks: {total_chunks}\n"
+        )
+
+        file.write(
+            "=" * 60
+            + "\n\n"
+        )
+
+        file.write(
+            translated
+        )
 
     try:
+
         await status_msg.delete()
-        with open(file_path, "rb") as f:
+
+        with open(
+            file_path,
+            "rb",
+        ) as file:
+
             await context.bot.send_document(
                 chat_id=chat.id,
-                document=f,
-                filename=os.path.basename(file_path),
-                caption=f"Translated to {target_language} (model: {model}).",
-                reply_markup=build_post_translate_keyboard(),
+                document=file,
+                filename=os.path.basename(
+                    file_path
+                ),
+                caption=(
+                    f"✅ Translation complete\n"
+                    f"Language: "
+                    f"{target_language}\n"
+                    f"Chunks: "
+                    f"{total_chunks}\n"
+                    f"Model: "
+                    f"{model}"
+                ),
+                reply_markup=(
+                    build_post_translate_keyboard()
+                ),
             )
+
     finally:
+
         try:
             os.remove(file_path)
         except OSError:
             pass
 
 
+# ==========================================================================
+# TTS FLOW
+# ==========================================================================
+
 async def run_voice_generation(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, source: str | None
-) -> None:
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    source: str | None,
+):
+
     chat = update.effective_chat
 
     if source == "original":
-        text = context.chat_data.get("last_transcript")
+
+        text = context.chat_data.get(
+            "last_transcript"
+        )
+
+        source_language = (
+            context.chat_data.get(
+                "last_source_language"
+            )
+        )
+
     elif source == "translated":
-        text = context.chat_data.get("last_translation")
+
+        text = context.chat_data.get(
+            "last_translation"
+        )
+
+        source_language = (
+            context.chat_data.get(
+                "last_translation_language"
+            )
+        )
+
     else:
-        # default: narrate the translation if one exists, else the raw transcript
-        text = context.chat_data.get("last_translation") or context.chat_data.get("last_transcript")
+
+        if context.chat_data.get(
+            "last_translation"
+        ):
+
+            text = (
+                context.chat_data.get(
+                    "last_translation"
+                )
+            )
+
+            source_language = (
+                context.chat_data.get(
+                    "last_translation_language"
+                )
+            )
+
+        else:
+
+            text = (
+                context.chat_data.get(
+                    "last_transcript"
+                )
+            )
+
+            source_language = (
+                context.chat_data.get(
+                    "last_source_language"
+                )
+            )
 
     if not text:
+
         await chat.send_message(
-            "No transcript on file yet. Fetch one first (send a YouTube link, "
-            "or /transcript <url>), then run /voice."
+            "No transcript on file yet."
         )
+
         return
 
-    voice = context.chat_data.get("edge_voice", DEFAULT_EDGE_VOICE)
-    video_id = context.chat_data.get("last_video_id", "audio")
+    voice = context.chat_data.get(
+        "edge_voice",
+        DEFAULT_EDGE_VOICE,
+    )
 
-    await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.UPLOAD_VOICE)
-    status_msg = await chat.send_message(f"Generating speech with {voice}…")
+    video_id = context.chat_data.get(
+        "last_video_id",
+        "audio",
+    )
 
-    file_path = f"/tmp/speech_{video_id}.mp3"
+    rate = get_tts_rate(
+        voice,
+        source_language,
+    )
+
+    await context.bot.send_chat_action(
+        chat_id=chat.id,
+        action=ChatAction.UPLOAD_VOICE,
+    )
+
+    status_msg = await chat.send_message(
+        "Generating narration…\n\n"
+        f"Voice: {voice}\n"
+        f"Rate: {rate}"
+    )
+
+    file_path = (
+        f"/tmp/speech_"
+        f"{video_id}.mp3"
+    )
+
     try:
-        await generate_speech(text, voice, file_path)
+
+        await generate_speech(
+            text,
+            voice,
+            file_path,
+            source_language,
+        )
+
     except Exception as exc:
-        logger.exception("TTS generation failed")
-        await status_msg.edit_text(f"Speech generation failed: {exc}")
+
+        logger.exception(
+            "TTS generation failed"
+        )
+
+        await status_msg.edit_text(
+            "Speech generation failed:\n"
+            f"{exc}"
+        )
+
         try:
             os.remove(file_path)
         except OSError:
             pass
+
         return
 
     try:
+
         await status_msg.delete()
-        with open(file_path, "rb") as f:
+
+        with open(
+            file_path,
+            "rb",
+        ) as file:
+
             await context.bot.send_audio(
                 chat_id=chat.id,
-                audio=f,
-                title=f"{video_id} narration",
+                audio=file,
+                title=(
+                    f"{video_id} narration"
+                ),
                 performer=voice,
-                caption=f"Voice: {voice}",
+                caption=(
+                    f"Voice: {voice}\n"
+                    f"Rate: {rate}"
+                ),
             )
+
     finally:
+
         try:
             os.remove(file_path)
         except OSError:
             pass
 
 
-async def send_all_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.effective_chat
+# ==========================================================================
+# HELPERS
+# ==========================================================================
+
+def chunk_lines(
+    lines,
+    max_chars=3800,
+):
+
+    chunks = []
+    current = ""
+
+    for line in lines:
+
+        if (
+            current
+            and len(current)
+            + len(line)
+            + 1
+            > max_chars
+        ):
+
+            chunks.append(
+                current
+            )
+
+            current = line
+
+        else:
+
+            current = (
+                f"{current}\n{line}"
+                if current
+                else line
+            )
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def format_duration(
+    seconds: float,
+):
+
+    seconds = int(
+        max(
+            0,
+            seconds,
+        )
+    )
+
+    if seconds < 60:
+
+        return f"{seconds}s"
+
+    minutes, seconds = divmod(
+        seconds,
+        60,
+    )
+
+    if minutes < 60:
+
+        return (
+            f"{minutes}m"
+            f"{seconds:02d}s"
+        )
+
+    hours, minutes = divmod(
+        minutes,
+        60,
+    )
+
+    return (
+        f"{hours}h"
+        f"{minutes:02d}m"
+    )
+
+
+# ==========================================================================
+# KEYBOARDS
+# ==========================================================================
+
+def build_main_menu_keyboard():
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "📄 Get transcript",
+                callback_data=(
+                    "menu:transcript"
+                ),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🌐 Translate",
+                callback_data=(
+                    "menu:translate"
+                ),
+            ),
+            InlineKeyboardButton(
+                "🔊 Narrate",
+                callback_data=(
+                    "menu:voice"
+                ),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "⚙️ Settings",
+                callback_data=(
+                    "menu:settings"
+                ),
+            )
+        ],
+    ])
+
+
+def build_post_transcript_keyboard():
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🌐 Translate",
+                callback_data=(
+                    "menu:translate"
+                ),
+            ),
+            InlineKeyboardButton(
+                "🔊 Narrate",
+                callback_data=(
+                    "narrate:original"
+                ),
+            ),
+        ]
+    ])
+
+
+def build_post_translate_keyboard():
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔊 Narrate",
+                callback_data=(
+                    "narrate:translated"
+                ),
+            ),
+            InlineKeyboardButton(
+                "🌐 Another language",
+                callback_data=(
+                    "menu:translate"
+                ),
+            ),
+        ]
+    ])
+
+
+def build_language_keyboard():
+
+    buttons = [
+        InlineKeyboardButton(
+            language,
+            callback_data=(
+                f"lang:{language}"
+            ),
+        )
+        for language
+        in QUICK_LANGUAGES
+    ]
+
+    rows = [
+        buttons[i:i + 3]
+        for i in range(
+            0,
+            len(buttons),
+            3,
+        )
+    ]
+
+    rows.append([
+        InlineKeyboardButton(
+            "✍️ Custom language",
+            callback_data=(
+                "lang:custom"
+            ),
+        )
+    ])
+
+    return InlineKeyboardMarkup(
+        rows
+    )
+
+
+def build_model_keyboard():
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                label,
+                callback_data=(
+                    f"setmodel:{model_id}"
+                ),
+            )
+        ]
+        for label, model_id
+        in QUICK_MODELS
+    ]
+
+    rows.append([
+        InlineKeyboardButton(
+            "📜 Browse models",
+            callback_data=(
+                "models:list"
+            ),
+        )
+    ])
+
+    return InlineKeyboardMarkup(
+        rows
+    )
+
+
+def build_voice_keyboard():
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                label,
+                callback_data=(
+                    f"setvoice:{voice_id}"
+                ),
+            )
+        ]
+        for label, voice_id
+        in QUICK_VOICES
+    ]
+
+    rows.append([
+        InlineKeyboardButton(
+            "📜 Browse voices",
+            callback_data=(
+                "voices:list"
+            ),
+        )
+    ])
+
+    return InlineKeyboardMarkup(
+        rows
+    )
+
+
+def build_settings_keyboard():
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🧠 Change model",
+                callback_data=(
+                    "changemodel"
+                ),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🎙 Change voice",
+                callback_data=(
+                    "changevoice"
+                ),
+            )
+        ],
+    ])
+
+
+def build_stop_keyboard(
+    run_id: str,
+):
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🛑 Stop",
+                callback_data=(
+                    f"stopbulk:{run_id}"
+                ),
+            )
+        ]
+    ])
+
+
+# ==========================================================================
+# HELP
+# ==========================================================================
+
+HELP_TEXT = """
+Send me a YouTube link and I'll fetch its transcript.
+
+TRANSCRIPT
+/transcript <url>
+
+TRANSLATION
+/translate <language>
+/translate <language> <youtube_url>
+
+/models
+/model <model_id>
+
+VOICE
+/voice
+/voice original
+/voice translated
+
+/voices <filter>
+/setvoice <voice_id>
+
+/settings
+
+PROXY
+/setproxy <proxy>
+/clearproxy
+/proxystatus
+/checkproxy
+/checkproxies <list>
+
+/stop
+
+Long translations are automatically split into
+smaller chunks and paced to stay under the
+NVIDIA 30 RPM limit.
+""".strip()
+
+
+# ==========================================================================
+# COMMANDS
+# ==========================================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    await update.message.reply_text(
+        HELP_TEXT,
+        reply_markup=(
+            build_main_menu_keyboard()
+        ),
+    )
+
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    await start(
+        update,
+        context,
+    )
+
+
+async def transcript_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "Usage: "
+            "/transcript <youtube_url>"
+        )
+
+        return
+
+    await run_transcript_fetch(
+        update,
+        context,
+        context.args[0],
+    )
+
+
+async def models_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
     if not NVIDIA_API_KEY:
-        await chat.send_message("NVIDIA_API_KEY is not set on the server.")
+
+        await update.message.reply_text(
+            "NVIDIA_API_KEY is not set."
+        )
+
         return
 
     loop = asyncio.get_running_loop()
+
     try:
-        models = await loop.run_in_executor(None, list_nvidia_models)
+
+        models = (
+            await loop.run_in_executor(
+                None,
+                list_nvidia_models,
+            )
+        )
+
     except Exception as exc:
-        await chat.send_message(f"Couldn't fetch model list: {exc}")
+
+        await update.message.reply_text(
+            f"Couldn't fetch models:\n"
+            f"{exc}"
+        )
+
         return
 
-    if not models:
-        await chat.send_message("NVIDIA returned no models for this key.")
+    lines = [
+        "NVIDIA models available:",
+        "",
+    ]
+
+    lines.extend(models)
+
+    for chunk in chunk_lines(
+        lines
+    ):
+
+        await update.message.reply_text(
+            chunk
+        )
+
+
+async def model_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if context.args:
+
+        model_id = (
+            " ".join(
+                context.args
+            )
+            .strip()
+        )
+
+        context.chat_data[
+            "nvidia_model"
+        ] = model_id
+
+        await update.message.reply_text(
+            "Translation model set to:\n"
+            f"{model_id}"
+        )
+
         return
 
-    header = "Models available to your key (pick any with /model <id>):"
-    for chunk in chunk_lines([header, ""] + models):
-        await chat.send_message(chunk)
+    current = context.chat_data.get(
+        "nvidia_model",
+        DEFAULT_NVIDIA_MODEL,
+    )
+
+    await update.message.reply_text(
+        "Current model:\n"
+        f"{current}\n\n"
+        "Choose another:",
+        reply_markup=(
+            build_model_keyboard()
+        ),
+    )
 
 
-async def send_all_voices(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, filter_str: str | None
-) -> None:
-    chat = update.effective_chat
+async def translate_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not NVIDIA_API_KEY:
+
+        await update.message.reply_text(
+            "NVIDIA_API_KEY is not set."
+        )
+
+        return
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "Usage:\n"
+            "/translate Hindi\n"
+            "/translate Spanish <youtube_url>"
+        )
+
+        return
+
+    args = list(
+        context.args
+    )
+
+    url = None
+
+    if (
+        args
+        and YOUTUBE_URL_PATTERN.search(
+            args[-1]
+        )
+    ):
+
+        url = args[-1]
+        args = args[:-1]
+
+    target_language = (
+        " ".join(args).strip()
+    )
+
+    if not target_language:
+
+        await update.message.reply_text(
+            "Please specify a language."
+        )
+
+        return
+
+    await run_translation(
+        update,
+        context,
+        target_language,
+        url,
+    )
+
+
+async def voices_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    filter_str = (
+        " ".join(
+            context.args
+        )
+        if context.args
+        else None
+    )
+
     try:
-        names = await list_edge_voices(filter_str)
+
+        names = await list_edge_voices(
+            filter_str
+        )
+
     except Exception as exc:
-        await chat.send_message(f"Couldn't fetch voice list: {exc}")
+
+        await update.message.reply_text(
+            f"Couldn't fetch voices:\n"
+            f"{exc}"
+        )
+
         return
 
     if not names:
-        await chat.send_message("No voices matched that filter.")
+
+        await update.message.reply_text(
+            "No voices matched."
+        )
+
         return
 
-    header = (
-        f"Voices matching '{filter_str}' (pick one with /setvoice <id>):"
-        if filter_str
-        else "All edge-tts voices — filter it, e.g. /voices en-US or /voices Hindi:"
-    )
-    for chunk in chunk_lines([header, ""] + names):
-        await chat.send_message(chunk)
+    lines = [
+        (
+            f"Voices matching "
+            f"'{filter_str}':"
+            if filter_str
+            else "Edge TTS voices:"
+        ),
+        "",
+    ]
+
+    lines.extend(names)
+
+    for chunk in chunk_lines(
+        lines
+    ):
+
+        await update.message.reply_text(
+            chunk
+        )
 
 
-async def send_settings_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.effective_chat
-    model = context.chat_data.get("nvidia_model", DEFAULT_NVIDIA_MODEL)
-    voice = context.chat_data.get("edge_voice", DEFAULT_EDGE_VOICE)
-    text = f"⚙️ Current settings\n\nTranslation model: {model}\nNarration voice: {voice}"
-    await chat.send_message(text, reply_markup=build_settings_keyboard())
+async def setvoice_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
-
-# --- Commands ---------------------------------------------------------
-
-HELP_TEXT = (
-    "Send me a YouTube link (or /transcript <url>) and I'll send back "
-    "a clean .txt transcript of the video.\n\n"
-    "Translation (NVIDIA NIM):\n"
-    "/translate <language> — translate the last transcript fetched here\n"
-    "/translate <language> <url> — fetch + translate in one go\n"
-    "/models — list every model your NVIDIA API key can use\n"
-    "/model <model_id> — pick which one to translate with\n\n"
-    "Voice (Edge TTS, free):\n"
-    "/voice [original|translated] — narrate the last transcript/translation as .mp3\n"
-    "/voices <filter> — browse voices, e.g. /voices en-US\n"
-    "/setvoice <voice_id> — pick which voice to narrate with\n\n"
-    "/settings — see and change your current model & voice\n\n"
-    "Proxy (only needed if YouTube blocks this server's IP):\n"
-    "The reliable way: just upload a .txt file with one proxy per line. "
-    "I'll test them all (with a live progress bar), activate the first "
-    "working one, and send back:\n"
-    "  • clean_proxies.txt — only the working ones\n"
-    "  • proxy_check_report.txt — full pass/fail with reasons\n\n"
-    "To cancel a running proxy check: tap the 🛑 Stop button on the progress "
-    "message, or send /stop.\n\n"
-    "/setproxy <anything> — auto-detect a single proxy and set it\n"
-    "/checkproxies <list> — test a short inline list\n"
-    "/proxystatus — show the current proxy\n"
-    "/checkproxy — re-verify the current proxy\n"
-    "/clearproxy — go back to a direct connection"
-)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(HELP_TEXT, reply_markup=build_main_menu_keyboard())
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(HELP_TEXT, reply_markup=build_main_menu_keyboard())
-
-
-async def transcript_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Usage: /transcript <youtube_url>")
-        return
-    await run_transcript_fetch(update, context, context.args[0])
-
-
-async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_all_models(update, context)
-
-
-async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if context.args:
-        model_id = " ".join(context.args).strip()
-        context.chat_data["nvidia_model"] = model_id
-        await update.message.reply_text(f"Translation model set to: {model_id}")
+
+        voice_id = (
+            context.args[0].strip()
+        )
+
+        context.chat_data[
+            "edge_voice"
+        ] = voice_id
+
+        await update.message.reply_text(
+            "Voice set to:\n"
+            f"{voice_id}"
+        )
+
         return
 
-    current = context.chat_data.get("nvidia_model", DEFAULT_NVIDIA_MODEL)
+    current = context.chat_data.get(
+        "edge_voice",
+        DEFAULT_EDGE_VOICE,
+    )
+
     await update.message.reply_text(
-        f"Current translation model: {current}\n\n"
-        "Pick a shortcut below, or set any other model your key supports "
-        "with /model <model_id>.",
-        reply_markup=build_model_keyboard(),
+        "Current voice:\n"
+        f"{current}",
+        reply_markup=(
+            build_voice_keyboard()
+        ),
     )
 
 
-async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not NVIDIA_API_KEY:
-        await update.message.reply_text("NVIDIA_API_KEY is not set on the server.")
-        return
-    if not context.args:
+async def voice_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    source = (
+        context.args[0].lower().strip()
+        if context.args
+        else None
+    )
+
+    if source not in (
+        None,
+        "original",
+        "translated",
+    ):
+
         await update.message.reply_text(
             "Usage:\n"
-            "/translate <language> — translate the last transcript fetched here\n"
-            "/translate <language> <youtube_url> — fetch + translate together\n"
-            "Example: /translate Hindi\n"
-            "Example: /translate Spanish https://youtu.be/dQw4w9WgXcQ"
+            "/voice\n"
+            "/voice original\n"
+            "/voice translated"
         )
+
         return
 
-    args = list(context.args)
-    url = args[-1] if args and YOUTUBE_URL_PATTERN.search(args[-1]) else None
-    if url:
-        args = args[:-1]
-    target_language = " ".join(args).strip()
-
-    if not target_language:
-        await update.message.reply_text("Please specify a target language, e.g. /translate French")
-        return
-
-    await run_translation(update, context, target_language, url)
-
-
-async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    filter_str = " ".join(context.args) if context.args else None
-    await send_all_voices(update, context, filter_str)
-
-
-async def setvoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if context.args:
-        voice_id = context.args[0].strip()
-        context.chat_data["edge_voice"] = voice_id
-        await update.message.reply_text(f"Voice set to: {voice_id}")
-        return
-
-    current = context.chat_data.get("edge_voice", DEFAULT_EDGE_VOICE)
-    await update.message.reply_text(
-        f"Current voice: {current}\n\n"
-        "Pick a shortcut below, or set any edge-tts voice with /setvoice <voice_id>.",
-        reply_markup=build_voice_keyboard(),
+    await run_voice_generation(
+        update,
+        context,
+        source,
     )
 
 
-async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    source = context.args[0].lower().strip() if context.args else None
-    if source is not None and source not in ("original", "translated"):
-        await update.message.reply_text(
-            "Usage: /voice — narrate the latest text\n"
-            "/voice original — force the original transcript\n"
-            "/voice translated — force the translated version"
-        )
-        return
-    await run_voice_generation(update, context, source)
+async def settings_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    model = context.chat_data.get(
+        "nvidia_model",
+        DEFAULT_NVIDIA_MODEL,
+    )
+
+    voice = context.chat_data.get(
+        "edge_voice",
+        DEFAULT_EDGE_VOICE,
+    )
+
+    await update.message.reply_text(
+        "⚙️ Current settings\n\n"
+        f"Translation model:\n"
+        f"{model}\n\n"
+        f"Narration voice:\n"
+        f"{voice}\n\n"
+        f"NVIDIA pacing:\n"
+        f"{NVIDIA_MIN_REQUEST_INTERVAL:.1f}s "
+        "between requests\n"
+        f"≈ "
+        f"{60 / NVIDIA_MIN_REQUEST_INTERVAL:.1f} "
+        "requests/min",
+        reply_markup=(
+            build_settings_keyboard()
+        ),
+    )
 
 
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_settings_message(update, context)
+# ==========================================================================
+# STOP
+# ==========================================================================
 
+async def stop_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
-async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Cancel the running bulk proxy check. Same effect as tapping the
-    🛑 Stop button on the progress message — this is just a typed
-    alternative that works even if the progress message has scrolled away."""
     if not is_owner(update):
-        await update.message.reply_text("Only the bot owner can stop a run.")
+
+        await update.message.reply_text(
+            "Only the bot owner can stop a run."
+        )
+
         return
 
-    run = context.chat_data.get("bulk_proxy_run")
+    run = context.chat_data.get(
+        "bulk_proxy_run"
+    )
+
     if not run:
-        await update.message.reply_text("No bulk proxy check is running right now.")
+
+        await update.message.reply_text(
+            "No bulk proxy check is running."
+        )
+
         return
 
     if run["stop"].is_set():
-        await update.message.reply_text("Already stopping — give it a couple of seconds.")
+
+        await update.message.reply_text(
+            "Already stopping."
+        )
+
         return
 
     run["stop"].set()
+
     await update.message.reply_text(
-        "🛑 Stopping the proxy check…\n"
-        "In-flight requests will finish within their timeouts, then the "
-        "partial results will still be saved to clean_proxies.txt + "
-        "proxy_check_report.txt."
+        "🛑 Stopping the proxy check…"
     )
 
 
-async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ==========================================================================
+# SET PROXY
+# ==========================================================================
+
+async def setproxy_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
     if not is_owner(update):
-        await update.message.reply_text("Only the bot owner can change the proxy.")
+
+        await update.message.reply_text(
+            "Only the bot owner can change "
+            "the proxy."
+        )
+
+        return
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "Usage:\n"
+            "/setproxy host:port\n"
+            "/setproxy host:port:user:pass\n"
+            "/setproxy user:pass@host:port\n"
+            "/setproxy socks5://host:port"
+        )
+
         return
 
     args = context.args
-    if not args:
-        await update.message.reply_text(
-            "Paste a proxy in ANY common shape and I'll auto-detect the format "
-            "and protocol, then verify it against YouTube before activating it:\n"
-            "• host:port:username:password\n"
-            "• username:password@host:port\n"
-            "• host:port (no auth)\n"
-            "• scheme://user:pass@host:port (http/https/socks5/socks4)\n\n"
-            "Or be explicit:\n"
-            "/setproxy webshare <username> <password>\n"
-            "/setproxy generic <http_url> [https_url]\n\n"
-            "For a LIST of proxies, just upload a .txt with one per line — that's "
-            "the reliable path, and you'll get back a clean file.\n\n"
-            f"Current: {describe_current_proxy()}"
-        )
-        return
 
     mode = args[0].lower()
+
     chat = update.effective_chat
 
     if mode == "webshare":
+
         if len(args) < 3:
-            await update.message.reply_text("Usage: /setproxy webshare <username> <password>")
+
+            await update.message.reply_text(
+                "Usage: "
+                "/setproxy webshare "
+                "<username> <password>"
+            )
+
             return
-        user, password = args[1], args[2]
-        previous = dict(current_proxy)
-        current_proxy.update(
-            type="webshare", webshare_username=user, webshare_password=password,
-            http_url="", https_url="",
+
+        username = args[1]
+        password = args[2]
+
+        previous = dict(
+            current_proxy
         )
-        status_msg = await chat.send_message(f"Testing Webshare ({user}) against YouTube…")
+
+        current_proxy.update(
+            type="webshare",
+            webshare_username=username,
+            webshare_password=password,
+            http_url="",
+            https_url="",
+        )
+
+        status = await chat.send_message(
+            "Testing Webshare proxy…"
+        )
+
         loop = asyncio.get_running_loop()
+
         try:
-            await loop.run_in_executor(None, test_proxy_against_youtube)
-        except Exception as exc:  # noqa: BLE001
+
+            await loop.run_in_executor(
+                None,
+                test_proxy_against_youtube,
+            )
+
+        except Exception as exc:
+
             current_proxy.clear()
-            current_proxy.update(previous)
-            await status_msg.edit_text(f"❌ Didn't work: {type(exc).__name__}: {exc}\nReverted.")
+            current_proxy.update(
+                previous
+            )
+
+            await status.edit_text(
+                "❌ Proxy failed:\n"
+                f"{exc}\n\n"
+                "Previous proxy restored."
+            )
+
             return
-        await status_msg.edit_text(f"✅ Working — proxy set: {describe_current_proxy()}")
+
+        await status.edit_text(
+            "✅ Webshare proxy works."
+        )
+
         return
 
     if mode == "generic":
+
         if len(args) < 2:
-            await update.message.reply_text("Usage: /setproxy generic <http_url> [https_url]")
+
+            await update.message.reply_text(
+                "Usage:\n"
+                "/setproxy generic "
+                "<http_url> [https_url]"
+            )
+
             return
+
         http_url = args[1]
-        https_url = args[2] if len(args) > 2 else args[1]
-        previous = dict(current_proxy)
+
+        https_url = (
+            args[2]
+            if len(args) > 2
+            else args[1]
+        )
+
+        previous = dict(
+            current_proxy
+        )
+
         current_proxy.update(
-            type="generic", http_url=http_url, https_url=https_url,
-            webshare_username="", webshare_password="",
+            type="generic",
+            http_url=http_url,
+            https_url=https_url,
+            webshare_username="",
+            webshare_password="",
         )
-        status_msg = await chat.send_message("Testing generic proxy against YouTube…")
+
+        status = await chat.send_message(
+            "Testing generic proxy…"
+        )
+
         loop = asyncio.get_running_loop()
+
         try:
-            await loop.run_in_executor(None, test_proxy_against_youtube)
-        except Exception as exc:  # noqa: BLE001
+
+            await loop.run_in_executor(
+                None,
+                test_proxy_against_youtube,
+            )
+
+        except Exception as exc:
+
             current_proxy.clear()
-            current_proxy.update(previous)
-            await status_msg.edit_text(f"❌ Didn't work: {type(exc).__name__}: {exc}\nReverted.")
+            current_proxy.update(
+                previous
+            )
+
+            await status.edit_text(
+                "❌ Proxy failed:\n"
+                f"{exc}\n\n"
+                "Previous proxy restored."
+            )
+
             return
-        await status_msg.edit_text(f"✅ Working — proxy set: {describe_current_proxy()}")
-        return
 
-    # Anything else: auto-detect. Accept one token, or several space-separated
-    # fields (host port user pass) that some providers export instead of colons.
-    candidate = args[0] if len(args) == 1 else ":".join(args)
-    parsed = parse_proxy_input(candidate)
-    if parsed is None:
-        await update.message.reply_text(
-            "Couldn't recognize that format. Paste it exactly as your provider gave "
-            "it to you, or be explicit with /setproxy webshare <user> <pass> or "
-            "/setproxy generic <http_url>."
+        await status.edit_text(
+            "✅ Generic proxy works."
         )
+
         return
 
-    host, port, user, password, forced_scheme = parsed
-    await auto_configure_proxy(chat, host, port, user, password, forced_scheme)
+    candidate = (
+        args[0]
+        if len(args) == 1
+        else ":".join(args)
+    )
+
+    parsed = parse_proxy_input(
+        candidate
+    )
+
+    if parsed is None:
+
+        await update.message.reply_text(
+            "Couldn't recognize that "
+            "proxy format."
+        )
+
+        return
+
+    (
+        host,
+        port,
+        user,
+        password,
+        forced_scheme,
+    ) = parsed
+
+    await auto_configure_proxy(
+        chat,
+        host,
+        port,
+        user,
+        password,
+        forced_scheme,
+    )
 
 
-# ----------------------------------------------------------------------
-# Bulk proxy check — the reliable file-in / file-out path
-# ----------------------------------------------------------------------
+# ==========================================================================
+# AUTO PROXY
+# ==========================================================================
+
+async def auto_configure_proxy(
+    chat,
+    host,
+    port,
+    user,
+    password,
+    forced_scheme=None,
+):
+
+    schemes = (
+        [forced_scheme]
+        if forced_scheme
+        else PROXY_SCHEMES_TO_TRY
+    )
+
+    status_msg = await chat.send_message(
+        "Auto-detecting proxy protocol for "
+        f"{host}:{port}…"
+    )
+
+    loop = asyncio.get_running_loop()
+
+    attempts = []
+
+    for scheme in schemes:
+
+        (
+            http_url,
+            https_url,
+        ) = build_generic_proxy_urls(
+            host,
+            port,
+            user,
+            password,
+            scheme,
+        )
+
+        try:
+
+            await loop.run_in_executor(
+                None,
+                test_proxy_via_urls,
+                http_url,
+                https_url,
+            )
+
+        except Exception as exc:
+
+            attempts.append(
+                f"{scheme}:// → {exc}"
+            )
+
+            continue
+
+        current_proxy.update(
+            type="generic",
+            http_url=http_url,
+            https_url=https_url,
+            webshare_username="",
+            webshare_password="",
+        )
+
+        await status_msg.edit_text(
+            "✅ Working proxy found.\n\n"
+            f"Protocol: {scheme}://\n"
+            f"Proxy: {host}:{port}"
+        )
+
+        return
+
+    await status_msg.edit_text(
+        "❌ No working protocol found.\n\n"
+        + "\n".join(attempts)
+    )
+
+
+# ==========================================================================
+# SINGLE PROXY CHECK
+# ==========================================================================
+
+async def checkproxy_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not is_owner(update):
+
+        await update.message.reply_text(
+            "Only the bot owner can run this."
+        )
+
+        return
+
+    status = await update.effective_chat.send_message(
+        "Testing current proxy…"
+    )
+
+    loop = asyncio.get_running_loop()
+
+    try:
+
+        await loop.run_in_executor(
+            None,
+            test_proxy_against_youtube,
+        )
+
+    except Exception as exc:
+
+        await status.edit_text(
+            "❌ Proxy test failed:\n"
+            f"{exc}"
+        )
+
+        return
+
+    await status.edit_text(
+        "✅ Proxy works and the full "
+        "YouTube transcript test passed."
+    )
+
+
+# ==========================================================================
+# PROXY STATUS
+# ==========================================================================
+
+async def proxystatus_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    await update.message.reply_text(
+        "Current proxy:\n"
+        + describe_current_proxy()
+    )
+
+
+# ==========================================================================
+# CLEAR PROXY
+# ==========================================================================
+
+async def clearproxy_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not is_owner(update):
+
+        await update.message.reply_text(
+            "Only the bot owner can change "
+            "the proxy."
+        )
+
+        return
+
+    current_proxy.update(
+        type=None,
+        webshare_username="",
+        webshare_password="",
+        http_url="",
+        https_url="",
+    )
+
+    await update.message.reply_text(
+        "Proxy cleared."
+    )
+
+
+# ==========================================================================
+# BULK PROXY CHECK
+# ==========================================================================
+
+class ProgressTracker:
+
+    def __init__(
+        self,
+        total,
+        status_msg,
+        header,
+        reply_markup=None,
+        stop_event=None,
+    ):
+
+        self.total = total
+
+        self.status_msg = (
+            status_msg
+        )
+
+        self.header = header
+
+        self.reply_markup = (
+            reply_markup
+        )
+
+        self.stop_event = (
+            stop_event
+        )
+
+        self.done = 0
+        self.passed = 0
+        self.failed = 0
+        self.skipped = 0
+
+        self.started = (
+            asyncio.get_running_loop()
+            .time()
+        )
+
+        self.lock = asyncio.Lock()
+
+        self.last_edit = 0.0
+
+    async def tick(
+        self,
+        ok,
+        skipped=False,
+    ):
+
+        async with self.lock:
+
+            self.done += 1
+
+            if skipped:
+
+                self.skipped += 1
+
+            elif ok:
+
+                self.passed += 1
+
+            else:
+
+                self.failed += 1
+
+            now = (
+                asyncio.get_running_loop()
+                .time()
+            )
+
+            should_edit = (
+                self.done
+                >= self.total
+                or (
+                    now
+                    - self.last_edit
+                    >= PROGRESS_EDIT_INTERVAL
+                )
+            )
+
+            if not should_edit:
+                return
+
+            self.last_edit = now
+
+        try:
+
+            await self.status_msg.edit_text(
+                self.render(),
+                reply_markup=(
+                    self.reply_markup
+                ),
+            )
+
+        except Exception:
+            pass
+
+    def render(self):
+
+        width = 18
+
+        ratio = (
+            self.done / self.total
+            if self.total
+            else 0
+        )
+
+        filled = int(
+            width * ratio
+        )
+
+        bar = (
+            "█" * filled
+            + "░" * (
+                width - filled
+            )
+        )
+
+        percent = ratio * 100
+
+        elapsed = (
+            asyncio.get_running_loop()
+            .time()
+            - self.started
+        )
+
+        rate = (
+            self.done / elapsed
+            if elapsed > 0
+            and self.done
+            else 0
+        )
+
+        remaining = (
+            self.total - self.done
+        )
+
+        eta = (
+            remaining / rate
+            if rate > 0
+            else 0
+        )
+
+        text = (
+            f"{self.header}\n\n"
+            f"`[{bar}]` "
+            f"{percent:5.1f}%\n\n"
+            f"✅ {self.passed} working\n"
+            f"❌ {self.failed} failed\n"
+            f"⚡ {rate:.1f}/s\n"
+            f"⏳ ETA "
+            f"{format_duration(eta)}"
+        )
+
+        if self.skipped:
+
+            text += (
+                f"\n⏭ {self.skipped} skipped"
+            )
+
+        if (
+            self.stop_event
+            and self.stop_event.is_set()
+        ):
+
+            text += (
+                "\n\n🛑 Stopping…"
+            )
+
+        return text
+
 
 async def check_proxy_candidate(
     loop,
-    semaphore: asyncio.Semaphore,
-    raw: str,
+    semaphore,
+    raw,
     parsed,
-    stop_event: asyncio.Event | None = None,
-) -> dict:
-    """
-    Test one proxy candidate reliably: try every viable protocol (or just the
-    one an explicit scheme:// URL specified), with one retry per protocol to
-    smooth over transient network blips. A definitive YouTube block is NOT
-    retried (retrying won't change a hard block) — everything else gets a
-    second attempt before being marked failed.
+    stop_event,
+):
 
-    If stop_event is set at any checkpoint, returns immediately with
-    skipped=True so a stopped run drains its queue in near-zero time.
-    """
-    def _skipped() -> dict:
+    if stop_event.is_set():
+
         return {
-            "raw": raw, "ok": False, "skipped": True, "scheme": None,
-            "http_url": None, "https_url": None, "note": "stopped",
+            "raw": raw,
+            "ok": False,
+            "skipped": True,
+            "scheme": None,
+            "http_url": None,
+            "https_url": None,
+            "note": "stopped",
         }
 
-    host, port, user, password, forced_scheme = parsed
-    schemes = [forced_scheme] if forced_scheme else PROXY_SCHEMES_TO_TRY
+    (
+        host,
+        port,
+        user,
+        password,
+        forced_scheme,
+    ) = parsed
+
+    schemes = (
+        [forced_scheme]
+        if forced_scheme
+        else PROXY_SCHEMES_TO_TRY
+    )
+
     attempts = []
+
     async with semaphore:
-        if stop_event is not None and stop_event.is_set():
-            return _skipped()
+
+        if stop_event.is_set():
+
+            return {
+                "raw": raw,
+                "ok": False,
+                "skipped": True,
+                "scheme": None,
+                "http_url": None,
+                "https_url": None,
+                "note": "stopped",
+            }
+
         for scheme in schemes:
-            if stop_event is not None and stop_event.is_set():
-                return _skipped()
-            http_url, https_url = build_generic_proxy_urls(host, port, user, password, scheme)
-            for attempt_num in (1, 2):
-                if stop_event is not None and stop_event.is_set():
-                    return _skipped()
-                try:
-                    await loop.run_in_executor(None, test_proxy_via_urls, http_url, https_url)
-                    return {
-                        "raw": raw, "ok": True, "skipped": False, "scheme": scheme,
-                        "http_url": http_url, "https_url": https_url,
-                        "note": f"working via {scheme}://",
-                    }
-                except (RequestBlocked, IpBlocked):
-                    attempts.append(f"{scheme}:// → blocked by YouTube")
-                    break  # deterministic block — retrying this scheme won't help
-                except Exception as exc:  # noqa: BLE001
-                    if attempt_num == 1:
-                        await asyncio.sleep(PROXY_CHECK_RETRY_DELAY)
-                        continue
-                    attempts.append(f"{scheme}:// → {type(exc).__name__}: {exc}")
+
+            if stop_event.is_set():
+
+                return {
+                    "raw": raw,
+                    "ok": False,
+                    "skipped": True,
+                    "scheme": None,
+                    "http_url": None,
+                    "https_url": None,
+                    "note": "stopped",
+                }
+
+            (
+                http_url,
+                https_url,
+            ) = build_generic_proxy_urls(
+                host,
+                port,
+                user,
+                password,
+                scheme,
+            )
+
+            try:
+
+                await loop.run_in_executor(
+                    None,
+                    test_proxy_via_urls,
+                    http_url,
+                    https_url,
+                )
+
+                return {
+                    "raw": raw,
+                    "ok": True,
+                    "skipped": False,
+                    "scheme": scheme,
+                    "http_url": http_url,
+                    "https_url": https_url,
+                    "note": (
+                        f"working via "
+                        f"{scheme}://"
+                    ),
+                }
+
+            except Exception as exc:
+
+                attempts.append(
+                    f"{scheme}:// → "
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                )
+
+                await asyncio.sleep(
+                    PROXY_CHECK_RETRY_DELAY
+                )
+
     return {
-        "raw": raw, "ok": False, "skipped": False, "scheme": None,
-        "http_url": None, "https_url": None,
-        "note": "; ".join(attempts) or "no working protocol",
+        "raw": raw,
+        "ok": False,
+        "skipped": False,
+        "scheme": None,
+        "http_url": None,
+        "https_url": None,
+        "note": (
+            "; ".join(attempts)
+            or "no working protocol"
+        ),
     }
 
 
 async def run_bulk_proxy_check(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    raw_text: str,
+    update,
+    context,
+    raw_text,
     status_msg=None,
-    source_label: str = "your list",
-) -> None:
-    """
-    The one engine behind /checkproxies and .txt-file uploads.
+    source_label="your list",
+):
 
-    Input:  raw text (one proxy per line, blank lines / # comments allowed)
-    Output: clean_proxies.txt (working only) + proxy_check_report.txt (full pass/fail),
-            and the first working proxy is activated (after full verification).
-    The run can be cancelled by either the 🛑 Stop inline button on the
-    progress message or the /stop command — both flip the same stop event.
-    """
     chat = update.effective_chat
 
-    raw_candidates = parse_proxy_lines(raw_text)
-    if not raw_candidates:
-        msg = "No proxy-looking lines found in that input."
-        if status_msg:
-            await status_msg.edit_text(msg)
-        else:
-            await chat.send_message(msg)
-        return
-
-    parsed_list: list[tuple[str, tuple]] = []
-    unparsed: list[str] = []
-    for raw in raw_candidates:
-        parsed = parse_proxy_input(raw)
-        if parsed is None:
-            unparsed.append(raw)
-        else:
-            parsed_list.append((raw, parsed))
-
-    if not parsed_list:
-        sample = "\n".join(unparsed[:5])
-        msg = (
-            f"None of the {len(raw_candidates)} lines looked like a proxy I could parse.\n"
-            f"First few:\n{sample}"
+    raw_candidates = (
+        parse_proxy_lines(
+            raw_text
         )
-        if status_msg:
-            await status_msg.edit_text(msg)
-        else:
-            await chat.send_message(msg)
-        return
-
-    total = len(parsed_list)
-    header = (
-        f"Testing {total} prox{'y' if total == 1 else 'ies'} from {source_label} "
-        f"({MAX_CONCURRENT_PROXY_CHECKS} parallel, "
-        f"{PROXY_CHECK_CONNECT_TIMEOUT:.0f}s/{PROXY_CHECK_READ_TIMEOUT:.0f}s timeouts)\n"
-        f"Tap 🛑 Stop below or send /stop to cancel."
     )
 
-    # Register the run so both the Stop button and /stop have something to flip.
-    # A fresh run_id makes sure a stale button from an earlier run can't cancel
-    # this one.
-    run_id = secrets.token_hex(4)
+    if not raw_candidates:
+
+        text = (
+            "No proxy-looking lines found."
+        )
+
+        if status_msg:
+
+            await status_msg.edit_text(
+                text
+            )
+
+        else:
+
+            await chat.send_message(
+                text
+            )
+
+        return
+
+    parsed_list = []
+    unparsed = []
+
+    for raw in raw_candidates:
+
+        parsed = parse_proxy_input(
+            raw
+        )
+
+        if parsed is None:
+
+            unparsed.append(raw)
+
+        else:
+
+            parsed_list.append(
+                (
+                    raw,
+                    parsed,
+                )
+            )
+
+    if not parsed_list:
+
+        await status_msg.edit_text(
+            "No valid proxy entries "
+            "could be parsed."
+        )
+
+        return
+
+    total = len(
+        parsed_list
+    )
+
+    run_id = secrets.token_hex(
+        4
+    )
+
     stop_event = asyncio.Event()
-    context.chat_data["bulk_proxy_run"] = {"id": run_id, "stop": stop_event}
-    stop_kb = build_stop_keyboard(run_id)
+
+    context.chat_data[
+        "bulk_proxy_run"
+    ] = {
+        "id": run_id,
+        "stop": stop_event,
+    }
+
+    header = (
+        f"Testing {total} proxies\n\n"
+        f"Parallel checks: "
+        f"{MAX_CONCURRENT_PROXY_CHECKS}\n"
+        f"Source: {source_label}"
+    )
+
+    keyboard = (
+        build_stop_keyboard(
+            run_id
+        )
+    )
 
     if status_msg:
-        await status_msg.edit_text(header, reply_markup=stop_kb)
+
+        await status_msg.edit_text(
+            header,
+            reply_markup=keyboard,
+        )
+
     else:
-        status_msg = await chat.send_message(header, reply_markup=stop_kb)
+
+        status_msg = await chat.send_message(
+            header,
+            reply_markup=keyboard,
+        )
 
     tracker = ProgressTracker(
-        total, status_msg, header,
-        reply_markup=stop_kb, stop_event=stop_event,
+        total,
+        status_msg,
+        header,
+        keyboard,
+        stop_event,
     )
 
     loop = asyncio.get_running_loop()
-    sem = asyncio.Semaphore(MAX_CONCURRENT_PROXY_CHECKS)
 
-    async def one(raw: str, parsed: tuple) -> dict:
-        result = await check_proxy_candidate(loop, sem, raw, parsed, stop_event)
-        await tracker.tick(result["ok"], skipped=result.get("skipped", False))
+    semaphore = asyncio.Semaphore(
+        MAX_CONCURRENT_PROXY_CHECKS
+    )
+
+    async def one(
+        raw,
+        parsed,
+    ):
+
+        result = (
+            await check_proxy_candidate(
+                loop,
+                semaphore,
+                raw,
+                parsed,
+                stop_event,
+            )
+        )
+
+        await tracker.tick(
+            result["ok"],
+            result.get(
+                "skipped",
+                False,
+            ),
+        )
+
         return result
 
+    tasks = [
+        asyncio.create_task(
+            one(
+                raw,
+                parsed,
+            )
+        )
+        for raw, parsed
+        in parsed_list
+    ]
+
     try:
-        results = await asyncio.gather(*(one(raw, p) for raw, p in parsed_list))
+
+        results = await asyncio.gather(
+            *tasks
+        )
+
     finally:
-        # Whether we finished or got cancelled, clear the run registration so
-        # /stop and the stop button have nothing to flip after the fact, and
-        # so a new run can start cleanly.
-        context.chat_data.pop("bulk_proxy_run", None)
 
-    was_stopped = stop_event.is_set()
-    passed = [r for r in results if r["ok"]]
-    failed = [r for r in results if not r["ok"] and not r.get("skipped")]
-    skipped = [r for r in results if r.get("skipped")]
+        context.chat_data.pop(
+            "bulk_proxy_run",
+            None,
+        )
 
-    # ---- build the two output files -----------------------------------
-    clean_body = "\n".join(r["raw"] for r in passed)
-    if clean_body:
-        clean_body += "\n"
+    passed = [
+        result
+        for result in results
+        if result["ok"]
+    ]
+
+    skipped = [
+        result
+        for result in results
+        if result.get("skipped")
+    ]
+
+    was_stopped = (
+        stop_event.is_set()
+    )
+
+    clean_path = (
+        "/tmp/clean_proxies.txt"
+    )
+
+    report_path = (
+        "/tmp/proxy_check_report.txt"
+    )
+
+    with open(
+        clean_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        for result in passed:
+
+            file.write(
+                result["raw"]
+                + "\n"
+            )
 
     report_lines = [
-        f"Proxy check report — {len(passed)}/{len(results)} working",
-        f"Source: {source_label}",
+        "Proxy check report",
+        "",
+        f"Total: {len(results)}",
+        f"Working: {len(passed)}",
+        f"Skipped: {len(skipped)}",
+        f"Unparsed: {len(unparsed)}",
+        "",
     ]
-    if was_stopped:
-        report_lines.append("Run was stopped early by the user.")
-    report_lines.append("")
-    for r in results:
-        if r.get("skipped"):
+
+    for result in results:
+
+        if result.get("skipped"):
+
             tag = "SKIP"
-        elif r["ok"]:
+
+        elif result["ok"]:
+
             tag = "PASS"
+
         else:
+
             tag = "FAIL"
-        report_lines.append(f"[{tag}] {r['raw']} — {r['note']}")
+
+        report_lines.append(
+            f"[{tag}] "
+            f"{result['raw']} — "
+            f"{result['note']}"
+        )
+
     if unparsed:
-        report_lines.append("")
-        report_lines.append(f"Couldn't parse ({len(unparsed)} lines, skipped):")
-        report_lines.extend(unparsed)
 
-    clean_path = "/tmp/clean_proxies.txt"
-    report_path = "/tmp/proxy_check_report.txt"
-    with open(clean_path, "w", encoding="utf-8") as f:
-        f.write(clean_body)
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(report_lines) + "\n")
+        report_lines.extend([
+            "",
+            "Unparsed:",
+        ])
 
-    # Remove the stop button by deleting the progress message before we post
-    # the result files. (Deleting the message removes its inline keyboard.)
+        report_lines.extend(
+            unparsed
+        )
+
+    with open(
+        report_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        file.write(
+            "\n".join(
+                report_lines
+            )
+        )
+
     try:
+
         await status_msg.delete()
+
     except Exception:
         pass
 
-    summary_parts = [f"{len(passed)}/{len(results)} working"]
-    if was_stopped:
-        summary_parts.append(f"stopped early ({len(skipped)} skipped)")
-    if unparsed:
-        summary_parts.append(f"{len(unparsed)} unparseable line(s) skipped")
-    summary = ", ".join(summary_parts)
+    if passed:
 
-    try:
-        if passed:
-            with open(clean_path, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=chat.id,
-                    document=f,
-                    filename="clean_proxies.txt",
-                    caption=f"✅ {summary}",
-                )
-        else:
-            await chat.send_message(f"❌ {summary} — no working proxies, nothing clean to send.")
+        with open(
+            clean_path,
+            "rb",
+        ) as file:
 
-        with open(report_path, "rb") as f:
             await context.bot.send_document(
                 chat_id=chat.id,
-                document=f,
-                filename="proxy_check_report.txt",
-                caption="Full pass/fail report.",
+                document=file,
+                filename=(
+                    "clean_proxies.txt"
+                ),
+                caption=(
+                    f"✅ "
+                    f"{len(passed)} working "
+                    f"proxy/proxies found."
+                ),
             )
-    finally:
-        for p in (clean_path, report_path):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
 
-    if passed:
-        top = passed[0]
-        # The bulk check was a fast reachability screen; before activating,
-        # re-verify the winner with the FULL transcript test so we don't set
-        # a proxy that reaches YouTube but can't actually fetch captions.
-        verify_msg = await chat.send_message(
-            f"Verifying the winner with a full transcript fetch: {top['raw']}…"
+    else:
+
+        await chat.send_message(
+            "❌ No working proxies found."
         )
+
+    with open(
+        report_path,
+        "rb",
+    ) as file:
+
+        await context.bot.send_document(
+            chat_id=chat.id,
+            document=file,
+            filename=(
+                "proxy_check_report.txt"
+            ),
+        )
+
+    for path in (
+        clean_path,
+        report_path,
+    ):
+
         try:
-            prev = dict(current_proxy)
-            current_proxy.update(
-                type="generic",
-                http_url=top["http_url"],
-                https_url=top["https_url"],
-                webshare_username="",
-                webshare_password="",
-            )
-            await loop.run_in_executor(None, test_proxy_against_youtube)
-        except Exception as exc:  # noqa: BLE001
-            current_proxy.clear()
-            current_proxy.update(prev)
-            await verify_msg.edit_text(
-                f"⚠️ {top['raw']} passed the reachability screen but failed the full "
-                f"transcript test ({type(exc).__name__}: {exc}).\n"
-                "Try another line from clean_proxies.txt with /setproxy."
-            )
-        else:
-            await verify_msg.edit_text(
-                f"🏆 Activated and fully verified: {top['raw']} (via {top['scheme']}://)\n"
-                "Run /proxystatus to confirm."
-            )
+            os.remove(path)
+        except OSError:
+            pass
+
+    # Full verification of first working proxy.
+    if not passed:
+        return
+
+    winner = passed[0]
+
+    verify_msg = await chat.send_message(
+        "Verifying first working proxy "
+        "with a full transcript test…"
+    )
+
+    previous = dict(
+        current_proxy
+    )
+
+    try:
+
+        current_proxy.update(
+            type="generic",
+            http_url=winner["http_url"],
+            https_url=winner["https_url"],
+            webshare_username="",
+            webshare_password="",
+        )
+
+        await loop.run_in_executor(
+            None,
+            test_proxy_against_youtube,
+        )
+
+    except Exception as exc:
+
+        current_proxy.clear()
+        current_proxy.update(
+            previous
+        )
+
+        await verify_msg.edit_text(
+            "⚠️ First proxy passed the "
+            "lightweight test but failed "
+            "full transcript verification.\n\n"
+            f"{exc}\n\n"
+            "Previous proxy restored."
+        )
+
+    else:
+
+        await verify_msg.edit_text(
+            "🏆 First working proxy activated "
+            "and fully verified.\n\n"
+            f"{winner['raw']}"
+        )
 
 
-async def checkproxies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ==========================================================================
+# CHECK PROXIES COMMAND
+# ==========================================================================
+
+async def checkproxies_command(
+    update,
+    context,
+):
+
     if not is_owner(update):
-        await update.message.reply_text("Only the bot owner can run this.")
+
+        await update.message.reply_text(
+            "Only the bot owner can run this."
+        )
+
         return
 
     if not context.args:
+
         await update.message.reply_text(
-            "Easiest way: just upload a .txt file with one proxy per line — "
-            "you'll get back clean_proxies.txt containing only the working ones, "
-            "plus a full proxy_check_report.txt. Cancel mid-run with the 🛑 Stop "
-            "button on the progress message or by sending /stop.\n\n"
-            "Or paste a short list inline (comma, semicolon, or newline separated):\n"
-            "/checkproxies 31.59.20.176:6754:user:pass, 45.12.13.14:8080:u2:p2"
+            "Upload a proxy list file or use:\n"
+            "/checkproxies host:port:user:pass"
         )
-        return
 
-    # context.args already split on whitespace; join back so the line-parser
-    # can also handle comma/semicolon splits.
-    raw_text = " ".join(context.args)
-    await run_bulk_proxy_check(update, context, raw_text, source_label="your message")
-
-
-async def proxy_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Primary interface for bulk proxy checking: upload a .txt (one proxy per
-    line) and get back clean_proxies.txt + proxy_check_report.txt.
-    """
-    if not is_owner(update):
-        await update.message.reply_text("Only the bot owner can check proxy lists.")
-        return
-
-    document = update.message.document
-    filename = document.file_name or "upload"
-    lower = filename.lower()
-
-    if not lower.endswith(ALLOWED_PROXY_FILE_EXTS):
-        await update.message.reply_text(
-            "Send your proxy list as a .txt file (also accepted: .csv, .list, .proxies), "
-            "one proxy per line."
-        )
-        return
-
-    if document.file_size and document.file_size > MAX_PROXY_FILE_BYTES:
-        await update.message.reply_text("That file's too large — keep proxy lists under 10 MB.")
-        return
-
-    status_msg = await update.message.reply_text(f"Reading {filename}…")
-    try:
-        tg_file = await context.bot.get_file(document.file_id)
-        raw_bytes = await tg_file.download_as_bytearray()
-    except Exception as exc:
-        await status_msg.edit_text(f"Couldn't download that file: {exc}")
-        return
-
-    text = bytes(raw_bytes).decode("utf-8", errors="ignore")
-    if not text.strip():
-        await status_msg.edit_text("That file looked empty.")
         return
 
     await run_bulk_proxy_check(
-        update, context, text, status_msg=status_msg, source_label=filename
+        update,
+        context,
+        " ".join(
+            context.args
+        ),
+        source_label="command",
     )
 
 
-async def clearproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ==========================================================================
+# PROXY FILE
+# ==========================================================================
+
+async def proxy_file_handler(
+    update,
+    context,
+):
+
     if not is_owner(update):
-        await update.message.reply_text("Only the bot owner can change the proxy.")
+
+        await update.message.reply_text(
+            "Only the bot owner can check "
+            "proxy lists."
+        )
+
         return
-    current_proxy.update(
-        type=None, webshare_username="", webshare_password="", http_url="", https_url=""
+
+    document = (
+        update.message.document
     )
-    await update.message.reply_text("Proxy cleared — requests will connect to YouTube directly.")
 
+    filename = (
+        document.file_name
+        or "upload"
+    )
 
-async def proxystatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(f"Current proxy: {describe_current_proxy()}")
+    if not filename.lower().endswith(
+        ALLOWED_PROXY_FILE_EXTS
+    ):
 
+        await update.message.reply_text(
+            "Upload .txt, .csv, .list "
+            "or .proxies file."
+        )
 
-async def checkproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_owner(update):
-        await update.message.reply_text("Only the bot owner can run this.")
         return
 
-    chat = update.effective_chat
-    proxy_desc = describe_current_proxy()
-    status_msg = await chat.send_message(f"Testing against YouTube via: {proxy_desc}…")
+    if (
+        document.file_size
+        and document.file_size
+        > MAX_PROXY_FILE_BYTES
+    ):
 
-    loop = asyncio.get_running_loop()
+        await update.message.reply_text(
+            "File is too large. "
+            "Maximum is 10 MB."
+        )
+
+        return
+
+    status_msg = (
+        await update.message.reply_text(
+            f"Reading {filename}…"
+        )
+    )
+
     try:
-        await loop.run_in_executor(None, test_proxy_against_youtube)
-    except (RequestBlocked, IpBlocked) as exc:
-        await status_msg.edit_text(
-            f"❌ Still blocked using {proxy_desc}.\n\n{exc}\n\n"
-            "This proxy/IP doesn't work for YouTube — try a different provider "
-            "or a fresh rotating-residential plan."
+
+        telegram_file = (
+            await context.bot.get_file(
+                document.file_id
+            )
         )
-        return
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Proxy check failed")
-        await status_msg.edit_text(f"❌ Test failed via {proxy_desc}:\n{exc}")
+
+        raw_bytes = (
+            await telegram_file.download_as_bytearray()
+        )
+
+    except Exception as exc:
+
+        await status_msg.edit_text(
+            "Couldn't download file:\n"
+            f"{exc}"
+        )
+
         return
 
-    await status_msg.edit_text(
-        f"✅ Working — successfully fetched a test transcript via: {proxy_desc}"
+    text = bytes(
+        raw_bytes
+    ).decode(
+        "utf-8",
+        errors="ignore",
+    )
+
+    if not text.strip():
+
+        await status_msg.edit_text(
+            "The file is empty."
+        )
+
+        return
+
+    await run_bulk_proxy_check(
+        update,
+        context,
+        text,
+        status_msg=status_msg,
+        source_label=filename,
     )
 
 
-# --- Callback router ---------------------------------------------------
+# ==========================================================================
+# CALLBACKS
+# ==========================================================================
 
-async def _reply_from_callback(query, context: ContextTypes.DEFAULT_TYPE, text: str,
-                               reply_markup: InlineKeyboardMarkup | None = None) -> None:
-    """Reply to a callback safely: prefer the original message, fall back to a
-    direct message to the user if the original message is unreachable."""
-    if query.message is not None:
-        await query.message.reply_text(text, reply_markup=reply_markup)
-    elif query.from_user is not None:
-        await context.bot.send_message(
-            chat_id=query.from_user.id, text=text, reply_markup=reply_markup
-        )
+async def button_callback(
+    update,
+    context,
+):
 
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+
     await query.answer()
+
     data = query.data or ""
 
-    if data.startswith("stopbulk:"):
-        # Set the stop event for the matching run. If the run already finished
-        # (or is a stale button from an earlier run), do nothing — the button
-        # will be gone in a moment anyway, since the progress message is
-        # deleted once the run ends.
-        run_id = data.split(":", 1)[1]
-        run = context.chat_data.get("bulk_proxy_run")
-        if run and run["id"] == run_id and not run["stop"].is_set():
+    # ----------------------------------------------------------------------
+    # STOP
+    # ----------------------------------------------------------------------
+
+    if data.startswith(
+        "stopbulk:"
+    ):
+
+        if not is_owner(update):
+
+            await query.answer(
+                "Only the owner can stop this.",
+                show_alert=True,
+            )
+
+            return
+
+        run_id = data.split(
+            ":",
+            1,
+        )[1]
+
+        run = context.chat_data.get(
+            "bulk_proxy_run"
+        )
+
+        if (
+            run
+            and run["id"] == run_id
+        ):
+
             run["stop"].set()
+
+            await query.answer(
+                "Stopping…"
+            )
+
+        else:
+
+            await query.answer(
+                "This run is no longer active."
+            )
+
         return
 
+    # ----------------------------------------------------------------------
+    # MENU
+    # ----------------------------------------------------------------------
+
     if data == "menu:transcript":
-        await _reply_from_callback(query, context, "Send me a YouTube link and I'll fetch the transcript.")
 
-    elif data == "menu:translate":
-        if not NVIDIA_API_KEY:
-            await _reply_from_callback(query, context, "NVIDIA_API_KEY is not set on the server.")
-            return
-        if not context.chat_data.get("last_transcript"):
-            await _reply_from_callback(
-                query, context, "No transcript on file yet — send a YouTube link first."
+        await query.message.reply_text(
+            "Send me a YouTube link."
+        )
+
+        return
+
+    if data == "menu:translate":
+
+        if not context.chat_data.get(
+            "last_transcript"
+        ):
+
+            await query.message.reply_text(
+                "Send a YouTube link first."
             )
+
             return
-        await _reply_from_callback(
-            query, context, "Pick a language:", reply_markup=build_language_keyboard()
+
+        await query.message.reply_text(
+            "Choose target language:",
+            reply_markup=(
+                build_language_keyboard()
+            ),
         )
 
-    elif data == "menu:voice":
-        await run_voice_generation(update, context, source=None)
+        return
 
-    elif data == "menu:settings":
-        await send_settings_message(update, context)
+    if data == "menu:voice":
 
-    elif data == "changemodel":
-        await _reply_from_callback(
-            query, context,
-            "Pick a shortcut, or use /model <model_id> for any other:",
-            reply_markup=build_model_keyboard(),
+        await run_voice_generation(
+            update,
+            context,
+            None,
         )
 
-    elif data == "changevoice":
-        await _reply_from_callback(
-            query, context,
-            "Pick a shortcut, or use /setvoice <voice_id> for any other:",
-            reply_markup=build_voice_keyboard(),
+        return
+
+    if data == "menu:settings":
+
+        await settings_command(
+            update,
+            context,
         )
 
-    elif data == "models:list":
-        await send_all_models(update, context)
+        return
 
-    elif data == "voices:list":
-        await send_all_voices(update, context, filter_str=None)
+    # ----------------------------------------------------------------------
+    # MODELS
+    # ----------------------------------------------------------------------
 
-    elif data.startswith("setmodel:"):
-        model_id = data.split(":", 1)[1]
-        context.chat_data["nvidia_model"] = model_id
-        await _reply_from_callback(query, context, f"Translation model set to: {model_id}")
+    if data == "changemodel":
 
-    elif data.startswith("setvoice:"):
-        voice_id = data.split(":", 1)[1]
-        context.chat_data["edge_voice"] = voice_id
-        await _reply_from_callback(query, context, f"Voice set to: {voice_id}")
+        await query.message.reply_text(
+            "Choose model:",
+            reply_markup=(
+                build_model_keyboard()
+            ),
+        )
 
-    elif data.startswith("lang:"):
-        lang = data.split(":", 1)[1]
-        if lang == "custom":
-            await _reply_from_callback(
-                query, context,
-                "Type it as: /translate <language>\nExample: /translate Bengali",
+        return
+
+    if data == "models:list":
+
+        await models_command(
+            update,
+            context,
+        )
+
+        return
+
+    if data.startswith(
+        "setmodel:"
+    ):
+
+        model_id = data.split(
+            ":",
+            1,
+        )[1]
+
+        context.chat_data[
+            "nvidia_model"
+        ] = model_id
+
+        await query.message.reply_text(
+            "Model set to:\n"
+            f"{model_id}"
+        )
+
+        return
+
+    # ----------------------------------------------------------------------
+    # VOICE
+    # ----------------------------------------------------------------------
+
+    if data == "changevoice":
+
+        await query.message.reply_text(
+            "Choose voice:",
+            reply_markup=(
+                build_voice_keyboard()
+            ),
+        )
+
+        return
+
+    if data == "voices:list":
+
+        await voices_command(
+            update,
+            context,
+        )
+
+        return
+
+    if data.startswith(
+        "setvoice:"
+    ):
+
+        voice_id = data.split(
+            ":",
+            1,
+        )[1]
+
+        context.chat_data[
+            "edge_voice"
+        ] = voice_id
+
+        await query.message.reply_text(
+            "Voice set to:\n"
+            f"{voice_id}"
+        )
+
+        return
+
+    # ----------------------------------------------------------------------
+    # LANGUAGE
+    # ----------------------------------------------------------------------
+
+    if data.startswith(
+        "lang:"
+    ):
+
+        language = data.split(
+            ":",
+            1,
+        )[1]
+
+        if language == "custom":
+
+            await query.message.reply_text(
+                "Use:\n"
+                "/translate <language>"
             )
+
             return
-        await run_translation(update, context, target_language=lang, url=None)
 
-    elif data.startswith("narrate:"):
-        source = data.split(":", 1)[1]
-        await run_voice_generation(update, context, source=source)
+        await run_translation(
+            update,
+            context,
+            language,
+            None,
+        )
+
+        return
+
+    # ----------------------------------------------------------------------
+    # NARRATION
+    # ----------------------------------------------------------------------
+
+    if data.startswith(
+        "narrate:"
+    ):
+
+        source = data.split(
+            ":",
+            1,
+        )[1]
+
+        await run_voice_generation(
+            update,
+            context,
+            source,
+        )
 
 
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text or ""
-    match = YOUTUBE_URL_PATTERN.search(text)
+# ==========================================================================
+# NORMAL MESSAGE
+# ==========================================================================
+
+async def message_handler(
+    update,
+    context,
+):
+
+    text = (
+        update.message.text
+        or ""
+    )
+
+    match = (
+        YOUTUBE_URL_PATTERN.search(
+            text
+        )
+    )
+
     if match:
-        await run_transcript_fetch(update, context, match.group(0))
-    else:
-        await update.message.reply_text(
-            "Send a YouTube link and I'll pull the transcript for you, or /help "
-            "for everything I can do."
+
+        await run_transcript_fetch(
+            update,
+            context,
+            match.group(0),
         )
 
+        return
 
-async def post_init(application: Application) -> None:
-    """Registers the native Telegram '/' command menu, resizes the default
-    executor so blocking proxy checks actually run in parallel, and logs
-    startup warnings."""
+    await update.message.reply_text(
+        "Send a YouTube link or use /help."
+    )
+
+
+# ==========================================================================
+# POST INIT
+# ==========================================================================
+
+async def post_init(
+    application,
+):
+
     await application.bot.set_my_commands([
-        BotCommand("start", "Welcome menu with buttons"),
-        BotCommand("help", "List everything the bot can do"),
-        BotCommand("transcript", "Get a transcript: /transcript <url>"),
-        BotCommand("translate", "Translate the transcript"),
-        BotCommand("models", "List available NVIDIA NIM models"),
-        BotCommand("model", "Set the translation model"),
-        BotCommand("voice", "Narrate the transcript as speech"),
-        BotCommand("voices", "Browse edge-tts voices"),
-        BotCommand("setvoice", "Set the narration voice"),
-        BotCommand("settings", "View/change model & voice"),
-        BotCommand("setproxy", "Configure a proxy for YouTube (owner only)"),
-        BotCommand("clearproxy", "Disable the proxy (owner only)"),
-        BotCommand("proxystatus", "Show the current proxy"),
-        BotCommand("checkproxy", "Test the proxy against YouTube (owner only)"),
-        BotCommand("checkproxies", "Test a whole list of proxies at once (owner only)"),
-        BotCommand("stop", "Cancel the running bulk proxy check (owner only)"),
+        BotCommand(
+            "start",
+            "Welcome menu",
+        ),
+        BotCommand(
+            "help",
+            "Show help",
+        ),
+        BotCommand(
+            "transcript",
+            "Get transcript",
+        ),
+        BotCommand(
+            "translate",
+            "Translate transcript",
+        ),
+        BotCommand(
+            "models",
+            "List NVIDIA models",
+        ),
+        BotCommand(
+            "model",
+            "Set NVIDIA model",
+        ),
+        BotCommand(
+            "voice",
+            "Narrate transcript",
+        ),
+        BotCommand(
+            "voices",
+            "List TTS voices",
+        ),
+        BotCommand(
+            "setvoice",
+            "Set TTS voice",
+        ),
+        BotCommand(
+            "settings",
+            "Show settings",
+        ),
+        BotCommand(
+            "setproxy",
+            "Set proxy",
+        ),
+        BotCommand(
+            "clearproxy",
+            "Clear proxy",
+        ),
+        BotCommand(
+            "proxystatus",
+            "Proxy status",
+        ),
+        BotCommand(
+            "checkproxy",
+            "Test proxy",
+        ),
+        BotCommand(
+            "checkproxies",
+            "Check proxy list",
+        ),
+        BotCommand(
+            "stop",
+            "Stop proxy check",
+        ),
     ])
 
-    # Resize the default ThreadPoolExecutor. Without this, loop.run_in_executor(None, ...)
-    # is capped at min(32, cpu+4) threads, so "50 parallel" would still run at ~32.
     loop = asyncio.get_running_loop()
+
     executor = ThreadPoolExecutor(
         max_workers=PROXY_CHECK_EXECUTOR_WORKERS,
-        thread_name_prefix="proxy-check",
+        thread_name_prefix="bot-worker",
     )
-    loop.set_default_executor(executor)
+
+    loop.set_default_executor(
+        executor
+    )
+
+    logger.info(
+        "Bot initialized."
+    )
+
+    logger.info(
+        "Default NVIDIA model: %s",
+        DEFAULT_NVIDIA_MODEL,
+    )
+
+    logger.info(
+        "Translation chunk size: %d chars",
+        TRANSLATION_MAX_CHARS,
+    )
+
+    logger.info(
+        "NVIDIA request interval: %.2fs "
+        "(~%.1f RPM)",
+        NVIDIA_MIN_REQUEST_INTERVAL,
+        60 / NVIDIA_MIN_REQUEST_INTERVAL,
+    )
 
     if OWNER_ID is None:
+
         logger.warning(
-            "OWNER_ID is not set — /setproxy, /clearproxy, /checkproxies and /stop "
-            "are open to ANY user of this bot. Set OWNER_ID to your numeric Telegram "
-            "user ID to lock them down."
+            "OWNER_ID is not configured."
         )
-    if not NVIDIA_API_KEY:
-        logger.info("NVIDIA_API_KEY not set — /translate and /models are disabled.")
-    logger.info(
-        "Bulk proxy checker: concurrency=%d, executor_workers=%d, "
-        "timeouts=%.1fs/%.1fs, retry_delay=%.1fs, progress_edit=%.1fs",
-        MAX_CONCURRENT_PROXY_CHECKS, PROXY_CHECK_EXECUTOR_WORKERS,
-        PROXY_CHECK_CONNECT_TIMEOUT, PROXY_CHECK_READ_TIMEOUT,
-        PROXY_CHECK_RETRY_DELAY, PROGRESS_EDIT_INTERVAL,
+
+
+# ==========================================================================
+# MAIN
+# ==========================================================================
+
+def main():
+
+    if not BOT_TOKEN:
+
+        raise SystemExit(
+            "BOT_TOKEN is not configured."
+        )
+
+    application = (
+        Application
+        .builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
     )
 
+    # ----------------------------------------------------------------------
+    # COMMANDS
+    # ----------------------------------------------------------------------
 
-def main() -> None:
-    if not BOT_TOKEN or BOT_TOKEN == "PUT-YOUR-TOKEN-HERE":
-        raise SystemExit(
-            "Set the BOT_TOKEN environment variable to your Telegram bot token first."
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start,
         )
+    )
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    application.add_handler(
+        CommandHandler(
+            "help",
+            help_command,
+        )
+    )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("transcript", transcript_command))
-    app.add_handler(CommandHandler("translate", translate_command))
-    app.add_handler(CommandHandler("models", models_command))
-    app.add_handler(CommandHandler("model", model_command))
-    app.add_handler(CommandHandler("voices", voices_command))
-    app.add_handler(CommandHandler("setvoice", setvoice_command))
-    app.add_handler(CommandHandler("voice", voice_command))
-    app.add_handler(CommandHandler("settings", settings_command))
-    app.add_handler(CommandHandler("setproxy", setproxy_command))
-    app.add_handler(CommandHandler("clearproxy", clearproxy_command))
-    app.add_handler(CommandHandler("proxystatus", proxystatus_command))
-    app.add_handler(CommandHandler("checkproxy", checkproxy_command))
-    app.add_handler(CommandHandler("checkproxies", checkproxies_command))
-    app.add_handler(CommandHandler("stop", stop_command))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.Document.ALL, proxy_file_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    application.add_handler(
+        CommandHandler(
+            "transcript",
+            transcript_command,
+        )
+    )
 
-    logger.info("Bot starting…")
-    app.run_polling()
+    application.add_handler(
+        CommandHandler(
+            "translate",
+            translate_command,
+        )
+    )
 
+    application.add_handler(
+        CommandHandler(
+            "models",
+            models_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "model",
+            model_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "voices",
+            voices_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "setvoice",
+            setvoice_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "voice",
+            voice_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "settings",
+            settings_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "setproxy",
+            setproxy_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "clearproxy",
+            clearproxy_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "proxystatus",
+            proxystatus_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "checkproxy",
+            checkproxy_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "checkproxies",
+            checkproxies_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "stop",
+            stop_command,
+        )
+    )
+
+    # ----------------------------------------------------------------------
+    # CALLBACKS
+    # ----------------------------------------------------------------------
+
+    application.add_handler(
+        CallbackQueryHandler(
+            button_callback
+        )
+    )
+
+    # ----------------------------------------------------------------------
+    # PROXY FILES
+    # ----------------------------------------------------------------------
+
+    application.add_handler(
+        MessageHandler(
+            filters.Document.ALL,
+            proxy_file_handler,
+        )
+    )
+
+    # ----------------------------------------------------------------------
+    # NORMAL TEXT
+    # ----------------------------------------------------------------------
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & ~filters.COMMAND,
+            message_handler,
+        )
+    )
+
+    logger.info(
+        "Starting Telegram bot…"
+    )
+
+    application.run_polling()
+
+
+# ==========================================================================
+# ENTRY
+# ==========================================================================
 
 if __name__ == "__main__":
     main()
