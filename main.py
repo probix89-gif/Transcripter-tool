@@ -146,6 +146,48 @@ ENGLISH_TTS_RATE = "-8%"
 # Other languages remain at normal speed.
 DEFAULT_TTS_RATE = "+0%"
 
+# --------------------------------------------------------------------------
+# BUGFIX / FEATURE:
+#
+# Edge TTS has no official length limit, but in practice a single very
+# long request over its websocket API is prone to simply hanging or
+# dying silently instead of raising a clean error - this is the
+# "not responding on long requests" problem.
+#
+# The fix: split long narration text into modest-sized chunks (same
+# safe splitter used for translation), synthesize each chunk on its
+# own with a hard timeout + retries, then stitch the resulting mp3
+# segments back together into one file.
+# --------------------------------------------------------------------------
+
+TTS_MAX_CHARS = int(
+    os.environ.get(
+        "TTS_MAX_CHARS",
+        "1800",
+    )
+)
+
+TTS_CHUNK_TIMEOUT = float(
+    os.environ.get(
+        "TTS_CHUNK_TIMEOUT",
+        "45",
+    )
+)
+
+TTS_MAX_RETRIES = int(
+    os.environ.get(
+        "TTS_MAX_RETRIES",
+        "3",
+    )
+)
+
+TTS_CHUNK_DELAY = float(
+    os.environ.get(
+        "TTS_CHUNK_DELAY",
+        "0.3",
+    )
+)
+
 
 # ==========================================================================
 # YOUTUBE / PROXY CONFIG
@@ -1791,12 +1833,120 @@ def get_tts_rate(
     return DEFAULT_TTS_RATE
 
 
+def chunk_text_for_tts(
+    text: str,
+    max_chars: int = TTS_MAX_CHARS,
+):
+    """
+    Splits narration text into safe-sized pieces for Edge TTS.
+
+    Reuses the same paragraph -> sentence -> word safe splitter that
+    powers translation chunking. It never cuts a word in half and
+    guarantees every chunk stays under max_chars.
+    """
+
+    return chunk_text_for_translation(
+        text,
+        max_chars,
+    )
+
+
+async def generate_speech_chunk(
+    text: str,
+    voice: str,
+    rate: str,
+    output_path: str,
+):
+    """
+    Synthesizes ONE chunk of text with a hard timeout and retries.
+
+    This is the actual fix for "Edge TTS not responding on long
+    requests": instead of one unbounded call that can hang forever,
+    each chunk gets a bounded time budget, and a failed/hung attempt
+    is retried with backoff instead of freezing the whole bot.
+    """
+
+    last_exc = None
+
+    for attempt in range(
+        TTS_MAX_RETRIES
+    ):
+
+        try:
+
+            communicate = edge_tts.Communicate(
+                text,
+                voice,
+                rate=rate,
+            )
+
+            await asyncio.wait_for(
+                communicate.save(
+                    output_path
+                ),
+                timeout=TTS_CHUNK_TIMEOUT,
+            )
+
+            if (
+                os.path.exists(output_path)
+                and os.path.getsize(output_path) > 0
+            ):
+
+                return
+
+            raise RuntimeError(
+                "Edge TTS produced an "
+                "empty audio file."
+            )
+
+        except Exception as exc:
+
+            last_exc = exc
+
+            logger.warning(
+                "Edge TTS chunk failed "
+                "(attempt %d/%d): %s",
+                attempt + 1,
+                TTS_MAX_RETRIES,
+                exc,
+            )
+
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+
+            await asyncio.sleep(
+                1.5 * (attempt + 1)
+            )
+
+    raise RuntimeError(
+        "Edge TTS failed after "
+        f"{TTS_MAX_RETRIES} attempts: "
+        f"{last_exc}"
+    )
+
+
 async def generate_speech(
     text: str,
     voice: str,
     output_path: str,
     source_language: str | None = None,
+    progress_cb: Callable[
+        [int, int],
+        Awaitable[None],
+    ] | None = None,
 ):
+    """
+    Chunk-based narration generator.
+
+    Long text is split into TTS_MAX_CHARS-sized pieces, each piece is
+    synthesized separately (with its own timeout/retry budget), and
+    the resulting mp3 segments are stitched into one final file.
+    Edge TTS emits plain MPEG audio frames with no ID3 container, so a
+    raw byte-level concatenation of the parts plays back correctly
+    end-to-end without needing ffmpeg on the host.
+    """
 
     rate = get_tts_rate(
         voice,
@@ -1809,15 +1959,105 @@ async def generate_speech(
         rate,
     )
 
-    communicate = edge_tts.Communicate(
+    chunks = chunk_text_for_tts(
         text,
-        voice,
-        rate=rate,
+        TTS_MAX_CHARS,
     )
 
-    await communicate.save(
-        output_path
+    total = len(chunks)
+
+    if total == 1:
+
+        await generate_speech_chunk(
+            chunks[0],
+            voice,
+            rate,
+            output_path,
+        )
+
+        if progress_cb:
+
+            try:
+                await progress_cb(1, 1)
+            except Exception:
+                pass
+
+        return
+
+    logger.info(
+        "TTS split into %d chunks "
+        "(max %d chars/chunk)",
+        total,
+        TTS_MAX_CHARS,
     )
+
+    part_paths = []
+
+    try:
+
+        for index, chunk in enumerate(
+            chunks,
+            start=1,
+        ):
+
+            part_path = (
+                f"{output_path}."
+                f"part{index}.mp3"
+            )
+
+            await generate_speech_chunk(
+                chunk,
+                voice,
+                rate,
+                part_path,
+            )
+
+            part_paths.append(
+                part_path
+            )
+
+            if progress_cb:
+
+                try:
+
+                    await progress_cb(
+                        index,
+                        total,
+                    )
+
+                except Exception:
+                    pass
+
+            if index < total:
+
+                await asyncio.sleep(
+                    TTS_CHUNK_DELAY
+                )
+
+        with open(
+            output_path,
+            "wb",
+        ) as outfile:
+
+            for part_path in part_paths:
+
+                with open(
+                    part_path,
+                    "rb",
+                ) as infile:
+
+                    outfile.write(
+                        infile.read()
+                    )
+
+    finally:
+
+        for part_path in part_paths:
+
+            try:
+                os.remove(part_path)
+            except OSError:
+                pass
 
 
 # ==========================================================================
@@ -2075,17 +2315,17 @@ async def run_translation(
             * NVIDIA_MIN_REQUEST_INTERVAL
         )
 
+        remaining_str = format_duration(
+            remaining_seconds
+        )
+
         try:
 
             await status_msg.edit_text(
                 "Translating long transcript…\n\n"
                 f"Model: {model}\n"
-                f"Progress: "
-                f"{done}/{total} chunks\n"
-                f"Remaining: "
-                f"{format_duration("
-                    remaining_seconds
-                )}\n"
+                f"Progress: {done}/{total} chunks\n"
+                f"Remaining: {remaining_str}\n"
                 f"Rate: "
                 f"~{60 / NVIDIA_MIN_REQUEST_INTERVAL:.1f}"
                 " requests/min"
@@ -2322,6 +2562,39 @@ async def run_voice_generation(
         f"{video_id}.mp3"
     )
 
+    async def progress(
+        done: int,
+        total: int,
+    ):
+
+        # Only worth reporting once text was actually split into
+        # multiple chunks; a single-chunk narration finishes fast.
+        if total <= 1:
+            return
+
+        try:
+
+            await context.bot.send_chat_action(
+                chat_id=chat.id,
+                action=ChatAction.UPLOAD_VOICE,
+            )
+
+        except Exception:
+            pass
+
+        try:
+
+            await status_msg.edit_text(
+                "Generating narration…\n\n"
+                f"Voice: {voice}\n"
+                f"Rate: {rate}\n"
+                f"Progress: "
+                f"{done}/{total} chunks"
+            )
+
+        except Exception:
+            pass
+
     try:
 
         await generate_speech(
@@ -2329,6 +2602,7 @@ async def run_voice_generation(
             voice,
             file_path,
             source_language,
+            progress,
         )
 
     except Exception as exc:
@@ -2710,6 +2984,10 @@ PROXY
 Long translations are automatically split into
 smaller chunks and paced to stay under the
 NVIDIA 30 RPM limit.
+
+Long narrations are automatically split into
+smaller chunks too, so Edge TTS doesn't stall
+or time out on big transcripts.
 """.strip()
 
 
@@ -4181,10 +4459,15 @@ async def checkproxies_command(
 
         return
 
+    # BUGFIX: joining args with a space and relying on a comma/semicolon
+    # splitter afterwards meant multiple space-separated proxies passed
+    # directly as command arguments (e.g. "/checkproxies a:1 b:2") were
+    # silently treated as one unparsable blob. Joining with newlines
+    # lets each argument be parsed as its own candidate line.
     await run_bulk_proxy_check(
         update,
         context,
-        " ".join(
+        "\n".join(
             context.args
         ),
         source_label="command",
@@ -4677,6 +4960,11 @@ async def post_init(
     logger.info(
         "Translation chunk size: %d chars",
         TRANSLATION_MAX_CHARS,
+    )
+
+    logger.info(
+        "TTS chunk size: %d chars",
+        TTS_MAX_CHARS,
     )
 
     logger.info(
